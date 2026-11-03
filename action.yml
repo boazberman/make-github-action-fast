@@ -1,0 +1,54 @@
+name: 'Make GitHub Action Fast'
+description: 'Accelerate GitHub Actions Linux workflows with LD_PRELOAD fsync bypass, aggressive page-cache sysctl, ext4 remount, Git optimizations, and optional zram workspace with deferred spillover.'
+author: 'boazberman'
+branding:
+  icon: 'zap'
+  color: 'yellow'
+
+inputs:
+  fsync-bypass:
+    description: 'Bypass fsync, fdatasync, sync, msync, and strip O_SYNC/O_DSYNC flags via LD_PRELOAD libnosync.so.'
+    required: false
+    default: 'true'
+  page-cache-tuning:
+    description: 'Tune Linux kernel dirty page cache ratios and flush intervals (dirty_ratio=80, dirty_background_ratio=50, swappiness=10).'
+    required: false
+    default: 'true'
+  remount-fast:
+    description: 'Remount ext4 filesystems (/ and /mnt) with noatime, nodiratime, barrier=0, and commit=600.'
+    required: false
+    default: 'true'
+  git-tuning:
+    description: 'Apply high-performance git configurations (manyFiles, untrackedCache, multi-threading, disable auto-gc).'
+    required: false
+    default: 'true'
+  zram-workspace:
+    description: 'Mount an in-memory compressed ext4 zram disk over the workspace to eliminate disk I/O.'
+    required: false
+    default: 'false'
+  zram-size:
+    description: 'Size of the zram disk (e.g. 6G, 8G, 512M). Ignored if zram-workspace is false.'
+    required: false
+    default: '6G'
+  spill-dirs:
+    description: 'Comma-separated directory names to bind-mount to /mnt/gh-fast-spill to prevent zram overflow. Only active when zram-workspace is true.'
+    required: false
+    default: 'node_modules,.cargo,.gradle,.venv,target'
+  summary:
+    description: 'Emit a detailed performance, optimization, and I/O telemetry table to $GITHUB_STEP_SUMMARY.'
+    required: false
+    default: 'true'
+
+outputs:
+  setup-time-ms:
+    description: 'Wall time taken by setup in milliseconds.'
+  fsync-bypass:
+    description: "Status of fsync bypass ('active', 'disabled', or 'failed')."
+  zram-device:
+    description: "Allocated zram device path (e.g. '/dev/zram0') or empty if not used."
+
+runs:
+  using: 'node20'
+  main: 'src/main.js'
+  post: 'src/post.js'
+  post-if: 'always()'

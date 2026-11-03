@@ -1,0 +1,20 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Compiled binaries and libraries
+*.so
+*.o
+*.a
+libnosync.so
+
+# Logs and runtime artifacts
+*.log
+/tmp/
+.gh-fast*
+
+# OS artifacts
+.DS_Store
+Thumbs.db
