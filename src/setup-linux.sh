@@ -402,14 +402,81 @@ EOF
     fi
   fi
 
-  # 3. Page cache tuning
+  # 3. Bloat suppression, CPU governor, and block queue optimizations
+  systemctl stop --no-block apt-daily.timer apt-daily-upgrade.timer fstrim.timer sysstat.timer unattended-upgrades.service multipathd.service multipathd.socket 2>/dev/null || true
+
+  for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    [[ -w "$gov" ]] && printf 'performance' > "$gov" 2>/dev/null || true
+  done
+
+  for b in /sys/block/*; do
+    [[ -e "$b" ]] || continue
+    case "${b##*/}" in
+      loop*|ram*|zram*|sr*|fd*|nbd*) continue ;;
+    esac
+    [[ -w "$b/queue/scheduler" ]] && echo none > "$b/queue/scheduler" 2>/dev/null || true
+    [[ -w "$b/queue/nr_requests" ]] && echo 512 > "$b/queue/nr_requests" 2>/dev/null || true
+    [[ -w "$b/queue/rq_affinity" ]] && echo 2 > "$b/queue/rq_affinity" 2>/dev/null || true
+    [[ -w "$b/queue/add_random" ]] && echo 0 > "$b/queue/add_random" 2>/dev/null || true
+    [[ -w "$b/queue/rotational" ]] && echo 0 > "$b/queue/rotational" 2>/dev/null || true
+  done
+
+  # 4. Page cache and sysctl tuning
   if [[ "$GHFAST_PAGE_CACHE" != "true" ]]; then
     state PAGE_CACHE "disabled"
   elif [[ "$IS_ROOT" != "true" ]]; then
     state PAGE_CACHE "skipped"
   else
-    local sysctl_keys=("vm.dirty_ratio" "vm.dirty_background_ratio" "vm.dirty_expire_centisecs" "vm.dirty_writeback_centisecs" "vm.swappiness" "fs.inotify.max_user_watches")
-    local sysctl_vals=("80" "50" "60000" "6000" "10" "1048576")
+    local sysctl_keys=(
+      "vm.dirty_ratio"
+      "vm.dirty_background_ratio"
+      "vm.dirty_expire_centisecs"
+      "vm.dirty_writeback_centisecs"
+      "vm.swappiness"
+      "fs.inotify.max_user_watches"
+      "kernel.sched_migration_cost_ns"
+      "kernel.sched_autogroup_enabled"
+      "kernel.numa_balancing"
+      "vm.overcommit_memory"
+      "vm.vfs_cache_pressure"
+      "fs.file-max"
+      "net.core.somaxconn"
+      "net.ipv4.tcp_max_syn_backlog"
+      "net.ipv4.tcp_tw_reuse"
+      "net.ipv4.ip_local_port_range"
+      "net.ipv4.tcp_fin_timeout"
+      "net.core.netdev_max_backlog"
+      "net.core.rmem_max"
+      "net.core.wmem_max"
+      "net.ipv4.tcp_rmem"
+      "net.ipv4.tcp_wmem"
+      "net.ipv4.tcp_fastopen"
+    )
+    local sysctl_vals=(
+      "80"
+      "50"
+      "60000"
+      "6000"
+      "10"
+      "1048576"
+      "5000000"
+      "0"
+      "0"
+      "1"
+      "50"
+      "2097152"
+      "65535"
+      "65535"
+      "1"
+      "1024 65535"
+      "15"
+      "10000"
+      "16777216"
+      "16777216"
+      "4096 87380 16777216"
+      "4096 65536 16777216"
+      "3"
+    )
 
     local orig_pairs=()
     for k in "${sysctl_keys[@]}"; do
@@ -432,12 +499,22 @@ EOF
       local k="${sysctl_keys[$idx]}"
       local v="${sysctl_vals[$idx]}"
       local p="/proc/sys/${k//.//}"
+      if [[ ! -e "$p" ]]; then
+        continue
+      fi
       if printf '%s' "$v" > "$p" 2>/dev/null; then
         ((success_cnt++)) || true
       else
         ((fail_cnt++)) || true
       fi
     done
+
+    # THP defrag
+    [[ -w /sys/kernel/mm/transparent_hugepage/defrag ]] && echo 'defer+madvise' > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
+
+    # TCP BBR congestion control
+    modprobe tcp_bbr 2>/dev/null || true
+    sysctl -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
 
     if [[ "$fail_cnt" -eq 0 ]]; then
       state PAGE_CACHE "active"
@@ -448,7 +525,7 @@ EOF
     fi
   fi
 
-  # 4. Remount
+  # 5. Remount
   if [[ "$GHFAST_REMOUNT" != "true" ]]; then
     state REMOUNT "disabled"
   elif [[ "$IS_ROOT" != "true" ]]; then
@@ -499,7 +576,7 @@ EOF
     state REMOUNT_DETAIL "$detail_str"
   fi
 
-  # 5. zram workspace
+  # 6. zram workspace
   local zram_active=0
   local arm_mode="any_entry"
   local ws_had_files=0
@@ -664,7 +741,7 @@ EOF
     arm_mode="immediate"
   fi
 
-  # 6. Spill dirs
+  # 7. Spill dirs
   if [[ "$zram_active" -eq 1 && -n "$GHFAST_SPILL_DIRS" ]]; then
     local spill_array=()
     IFS=',' read -r -a spill_array <<< "$GHFAST_SPILL_DIRS"
@@ -699,7 +776,7 @@ EOF
     state SPILL_HELPER_PID ""
   fi
 
-  # 7. Git tuning
+  # 8. Git tuning
   if [[ "$GHFAST_GIT_TUNING" != "true" ]]; then
     state GIT_TUNING "disabled"
   elif ! command -v git >/dev/null 2>&1; then
@@ -743,7 +820,7 @@ EOF
     fi
   fi
 
-  # 8. Wait for background compile and finalize state
+  # 9. Wait for background compile and finalize state
   if [[ -n "$compile_pid" ]]; then
     wait "$compile_pid" 2>/dev/null || true
   fi

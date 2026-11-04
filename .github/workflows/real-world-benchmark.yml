@@ -46,17 +46,17 @@ jobs:
           - name: fastapi
             repo: fastapi/fastapi
             ref: 0.115.4
-            prefetch: 'pip install uv && uv pip install -e ".[all]" --system'
-            install: 'uv pip install -e ".[all]" --offline --system'
+            prefetch: 'python3 -m venv .venv && source .venv/bin/activate && pip install uv && uv pip install -e ".[all]"'
+            install: 'source .venv/bin/activate && uv pip install -e ".[all]" --offline'
             build: ''
-            test: 'pytest tests/test_tutorial -q'
+            test: 'source .venv/bin/activate && pytest tests/test_tutorial -q'
           - name: redis
             repo: redis/redis
             ref: 7.2.5
             prefetch: ''
             install: ''
             build: 'make -j"$(nproc)"'
-            test: './runtest --single unit/type/string'
+            test: 'mkdir -p /tmp/r && ./runtest --single unit/type/string --tmpdir /tmp/r'
 
     steps:
       # The action lives in a subfolder so a zram workspace mount does not hide it.

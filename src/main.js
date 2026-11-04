@@ -152,7 +152,7 @@ function run() {
     const rawState = safeReadFile(stateFile);
     const state = parseEnvFile(rawState || '');
 
-    // 1. Fsync bypass LD_PRELOAD handling
+    // 1. Environment injection (LD_PRELOAD and build tuning)
     if (state.FSYNC_BYPASS === 'active' && state.LD_PRELOAD_VALUE) {
       const existingPreload = process.env.LD_PRELOAD || '';
       let preloadVal = state.LD_PRELOAD_VALUE;
@@ -167,6 +167,14 @@ function run() {
       appendGithubEnv('LD_PRELOAD', preloadVal);
       appendGithubEnv('NOSYNC_ACTIVE', '1');
     }
+
+    const cpuCount = (os.cpus() && os.cpus().length) || 2;
+    appendGithubEnv('MALLOC_ARENA_MAX', String(cpuCount));
+    appendGithubEnv('MALLOC_TRIM_THRESHOLD_', '524288');
+    appendGithubEnv('MAKEFLAGS', `-j${cpuCount}`);
+    appendGithubEnv('CMAKE_BUILD_PARALLEL_LEVEL', String(cpuCount));
+    appendGithubEnv('CARGO_NET_GIT_FETCH_WITH_CLI', 'true');
+    appendGithubEnv('CARGO_INCREMENTAL', '0');
 
     // 2. Git fallback if git-tuning enabled and setup script failed / didn't set it
     if (inputs.gitTuning && (state.GIT_TUNING === 'failed' || !state.GIT_TUNING)) {
