@@ -12,5 +12,5 @@
     "build:lib": "gcc -O2 -shared -fPIC -U_FORTIFY_SOURCE -D_GNU_SOURCE -Wall -o libnosync.so src/nosync.c -ldl"
   },
   "repository": "boazberman/make-github-action-fast",
-  "license": "MIT"
+  "license": "BUSL-1.1"
 }

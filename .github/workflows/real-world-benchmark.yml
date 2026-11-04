@@ -1,0 +1,163 @@
+name: Real-world Benchmark
+
+# Clones popular open-source repositories (pinned to release tags) and builds each
+# one on a fresh runner with and without this action, then publishes a comparison.
+
+on:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.project.name }} / ${{ matrix.mode }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [baseline, accelerated, accelerated-zram]
+        project:
+          - name: redis
+            repo: redis/redis
+            ref: 7.2.5
+            deps: 'true'
+            build: 'make -j"$(nproc)"'
+          - name: ripgrep
+            repo: BurntSushi/ripgrep
+            ref: 14.1.1
+            deps: 'cargo fetch --locked'
+            build: 'cargo build --release --locked'
+          - name: vue-core
+            repo: vuejs/core
+            ref: v3.4.27
+            deps: 'corepack enable && pnpm install --frozen-lockfile'
+            build: 'pnpm build'
+
+    steps:
+      # The action lives in a subfolder so a zram workspace mount does not hide it.
+      - name: Checkout action source
+        uses: actions/checkout@v4
+        with:
+          path: _action
+
+      - name: Accelerate runner
+        if: matrix.mode == 'accelerated'
+        uses: ./_action
+
+      - name: Accelerate runner (zram)
+        if: matrix.mode == 'accelerated-zram'
+        uses: ./_action
+        with:
+          zram-workspace: 'true'
+          zram-size: '8G'
+          spill-dirs: 'node_modules,target'
+
+      - name: Clone ${{ matrix.project.repo }}
+        id: clone
+        run: |
+          start=$(date +%s%N)
+          git clone --quiet --depth 1 --branch "${{ matrix.project.ref }}" \
+            "https://github.com/${{ matrix.project.repo }}.git" "$GITHUB_WORKSPACE/target-repo"
+          echo "ms=$(( ($(date +%s%N) - start) / 1000000 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        id: deps
+        working-directory: target-repo
+        run: |
+          start=$(date +%s%N)
+          ${{ matrix.project.deps }}
+          echo "ms=$(( ($(date +%s%N) - start) / 1000000 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        id: build
+        working-directory: target-repo
+        run: |
+          start=$(date +%s%N)
+          ${{ matrix.project.build }}
+          echo "ms=$(( ($(date +%s%N) - start) / 1000000 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Record results
+        run: |
+          mkdir -p "$RUNNER_TEMP/results"
+          cat > "$RUNNER_TEMP/results/${{ matrix.project.name }}-${{ matrix.mode }}.json" <<EOF
+          {
+            "project": "${{ matrix.project.name }}",
+            "mode": "${{ matrix.mode }}",
+            "clone_ms": ${{ steps.clone.outputs.ms }},
+            "deps_ms": ${{ steps.deps.outputs.ms }},
+            "build_ms": ${{ steps.build.outputs.ms }}
+          }
+          EOF
+          cat "$RUNNER_TEMP/results/"*.json
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw-${{ matrix.project.name }}-${{ matrix.mode }}
+          path: ${{ runner.temp }}/results/*.json
+          retention-days: 7
+
+  compare:
+    name: Compare results
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rw-*
+          merge-multiple: true
+          path: results
+
+      - name: Generate report
+        run: |
+          python3 - <<'PY'
+          import glob, json, os
+
+          data = {}
+          for f in sorted(glob.glob("results/*.json")):
+              with open(f, encoding="utf-8") as fp:
+                  r = json.load(fp)
+              data.setdefault(r["project"], {})[r["mode"]] = r
+
+          def total(r):
+              return r["clone_ms"] + r["deps_ms"] + r["build_ms"]
+
+          def fmt(ms):
+              return f"{ms / 1000:.1f}s"
+
+          out = ["## Real-world build benchmark", "",
+                 "Wall-clock times on `ubuntu-24.04` (clone + dependency install + build). "
+                 "Runs are on separate VMs and dependency downloads depend on network, so expect some noise.", "",
+                 "| Project | Phase | Baseline | Accelerated | Speedup | Accelerated (zram) | Speedup |",
+                 "|:---|:---|---:|---:|---:|---:|---:|"]
+          phases = [("clone_ms", "clone"), ("deps_ms", "deps"), ("build_ms", "build"), (None, "**total**")]
+          for project in sorted(data):
+              modes = data[project]
+              base = modes.get("baseline")
+              for key, label in phases:
+                  def val(m):
+                      r = modes.get(m)
+                      if not r:
+                          return None
+                      return total(r) if key is None else r[key]
+                  b, a, z = val("baseline"), val("accelerated"), val("accelerated-zram")
+                  def cell(v):
+                      return fmt(v) if v is not None else "n/a"
+                  def speed(v):
+                      return f"{b / v:.2f}x" if b and v else "-"
+                  out.append(f"| {project} | {label} | {cell(b)} | {cell(a)} | {speed(a)} | {cell(z)} | {speed(z)} |")
+          report = "\n".join(out)
+          print(report)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write(report + "\n")
+          PY
