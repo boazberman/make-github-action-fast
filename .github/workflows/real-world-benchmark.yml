@@ -1,10 +1,13 @@
 name: Real-world Benchmark
 
-# Clones popular open-source repositories (pinned to release tags) and builds each
-# one on a fresh runner with and without this action, then publishes a comparison.
+# Clones popular open-source repositories (pinned to release tags) and runs their
+# build and verification pipelines on fresh runners with and without this action,
+# then publishes a detailed performance comparison table.
 
 on:
-  pull_request:
+  push:
+    branches:
+      - main
   workflow_dispatch:
   schedule:
     - cron: '0 3 * * 1'
@@ -26,21 +29,34 @@ jobs:
       matrix:
         mode: [baseline, accelerated, accelerated-zram]
         project:
-          - name: redis
-            repo: redis/redis
-            ref: 7.2.5
-            deps: 'true'
-            build: 'make -j"$(nproc)"'
-          - name: ripgrep
-            repo: BurntSushi/ripgrep
-            ref: 14.1.1
-            deps: 'cargo fetch --locked'
-            build: 'cargo build --release --locked'
           - name: vue-core
             repo: vuejs/core
             ref: v3.4.27
-            deps: 'corepack enable && pnpm install --frozen-lockfile'
+            prefetch: 'corepack enable && pnpm fetch'
+            install: 'pnpm install --frozen-lockfile --prefer-offline'
             build: 'pnpm build'
+            test: 'pnpm test-unit --run'
+          - name: ripgrep
+            repo: BurntSushi/ripgrep
+            ref: 14.1.1
+            prefetch: 'cargo fetch --locked'
+            install: ''
+            build: 'cargo build --release --locked'
+            test: 'cargo test --lib --locked'
+          - name: fastapi
+            repo: fastapi/fastapi
+            ref: 0.115.4
+            prefetch: 'pip install uv && uv sync --frozen'
+            install: 'uv sync --frozen --offline'
+            build: ''
+            test: 'uv run --no-sync pytest tests/test_tutorial -q'
+          - name: redis
+            repo: redis/redis
+            ref: 7.2.5
+            prefetch: ''
+            install: ''
+            build: 'make -j"$(nproc)"'
+            test: 'tclsh tests/test_helper.tcl --single unit/basic'
 
     steps:
       # The action lives in a subfolder so a zram workspace mount does not hide it.
@@ -49,7 +65,7 @@ jobs:
         with:
           path: _action
 
-      - name: Accelerate runner
+      - name: Accelerate runner (standard)
         if: matrix.mode == 'accelerated'
         uses: ./_action
 
@@ -59,25 +75,36 @@ jobs:
         with:
           zram-workspace: 'true'
           zram-size: '8G'
-          spill-dirs: 'node_modules,target'
+          spill-dirs: 'target-repo/node_modules,target-repo/target,target-repo/.venv'
 
       - name: Clone ${{ matrix.project.repo }}
-        id: clone
         run: |
-          start=$(date +%s%N)
           git clone --quiet --depth 1 --branch "${{ matrix.project.ref }}" \
             "https://github.com/${{ matrix.project.repo }}.git" "$GITHUB_WORKSPACE/target-repo"
-          echo "ms=$(( ($(date +%s%N) - start) / 1000000 ))" >> "$GITHUB_OUTPUT"
 
-      - name: Install dependencies
-        id: deps
+      - name: Install system dependencies (redis)
+        if: matrix.project.name == 'redis'
+        run: |
+          if ! command -v tclsh >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq tcl
+          fi
+
+      - name: Prefetch dependencies (untimed)
+        if: matrix.project.prefetch != ''
+        working-directory: target-repo
+        run: ${{ matrix.project.prefetch }}
+
+      - name: Install dependencies (timed)
+        if: matrix.project.install != ''
+        id: install
         working-directory: target-repo
         run: |
           start=$(date +%s%N)
-          ${{ matrix.project.deps }}
+          ${{ matrix.project.install }}
           echo "ms=$(( ($(date +%s%N) - start) / 1000000 ))" >> "$GITHUB_OUTPUT"
 
-      - name: Build
+      - name: Build (timed)
+        if: matrix.project.build != ''
         id: build
         working-directory: target-repo
         run: |
@@ -85,19 +112,37 @@ jobs:
           ${{ matrix.project.build }}
           echo "ms=$(( ($(date +%s%N) - start) / 1000000 ))" >> "$GITHUB_OUTPUT"
 
+      - name: Test (timed)
+        if: matrix.project.test != ''
+        id: test
+        working-directory: target-repo
+        run: |
+          start=$(date +%s%N)
+          ${{ matrix.project.test }}
+          echo "ms=$(( ($(date +%s%N) - start) / 1000000 ))" >> "$GITHUB_OUTPUT"
+
       - name: Record results
         run: |
           mkdir -p "$RUNNER_TEMP/results"
-          cat > "$RUNNER_TEMP/results/${{ matrix.project.name }}-${{ matrix.mode }}.json" <<EOF
-          {
-            "project": "${{ matrix.project.name }}",
-            "mode": "${{ matrix.mode }}",
-            "clone_ms": ${{ steps.clone.outputs.ms }},
-            "deps_ms": ${{ steps.deps.outputs.ms }},
-            "build_ms": ${{ steps.build.outputs.ms }}
+          python3 - <<'PY'
+          import json, os
+
+          data = {
+              "project": "${{ matrix.project.name }}",
+              "mode": "${{ matrix.mode }}",
+              "install_ms": int("${{ steps.install.outputs.ms }}") if "${{ steps.install.outputs.ms }}" else None,
+              "build_ms": int("${{ steps.build.outputs.ms }}") if "${{ steps.build.outputs.ms }}" else None,
+              "test_ms": int("${{ steps.test.outputs.ms }}") if "${{ steps.test.outputs.ms }}" else None,
           }
-          EOF
-          cat "$RUNNER_TEMP/results/"*.json
+          valid_ms = [v for v in [data["install_ms"], data["build_ms"], data["test_ms"]] if v is not None]
+          data["total_ms"] = sum(valid_ms) if valid_ms else None
+
+          path = os.path.join(os.environ["RUNNER_TEMP"], "results", "${{ matrix.project.name }}-${{ matrix.mode }}.json")
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(data, f, indent=2)
+
+          print(json.dumps(data, indent=2))
+          PY
 
       - name: Upload results
         uses: actions/upload-artifact@v4
@@ -125,39 +170,89 @@ jobs:
 
           data = {}
           for f in sorted(glob.glob("results/*.json")):
-              with open(f, encoding="utf-8") as fp:
-                  r = json.load(fp)
-              data.setdefault(r["project"], {})[r["mode"]] = r
-
-          def total(r):
-              return r["clone_ms"] + r["deps_ms"] + r["build_ms"]
+              try:
+                  with open(f, encoding="utf-8") as fp:
+                      r = json.load(fp)
+                  data.setdefault(r["project"], {})[r["mode"]] = r
+              except Exception as exc:
+                  print(f"Warning: could not parse {f}: {exc}")
 
           def fmt(ms):
+              if ms is None:
+                  return "n/a"
+              if ms < 10000:
+                  return f"{ms / 1000:.2f}s"
               return f"{ms / 1000:.1f}s"
 
-          out = ["## Real-world build benchmark", "",
-                 "Wall-clock times on `ubuntu-24.04` (clone + dependency install + build). "
-                 "Runs are on separate VMs and dependency downloads depend on network, so expect some noise.", "",
-                 "| Project | Phase | Baseline | Accelerated | Speedup | Accelerated (zram) | Speedup |",
-                 "|:---|:---|---:|---:|---:|---:|---:|"]
-          phases = [("clone_ms", "clone"), ("deps_ms", "deps"), ("build_ms", "build"), (None, "**total**")]
-          for project in sorted(data):
+          out = [
+              "## Real-World CI Benchmark Results",
+              "",
+              "Wall-clock execution times on `ubuntu-24.04` (GitHub-hosted runner).",
+              "Dependency prefetching is untimed to eliminate network download variance.",
+              "Timed phases measure actual disk I/O, compilation, and test execution.",
+              "",
+              "| Project | Phase | Baseline | Accelerated | Speedup | Accelerated (zram) | Speedup |",
+              "|:---|:---|---:|---:|---:|---:|---:|",
+          ]
+
+          phases = [
+              ("install_ms", "install"),
+              ("build_ms", "build"),
+              ("test_ms", "test"),
+              ("total_ms", "**total**"),
+          ]
+
+          order = ["vue-core", "ripgrep", "fastapi", "redis"]
+          projects = sorted(data.keys(), key=lambda p: order.index(p) if p in order else 99)
+
+          for project in projects:
               modes = data[project]
-              base = modes.get("baseline")
+              base = modes.get("baseline", {})
+              acc = modes.get("accelerated", {})
+              zram = modes.get("accelerated-zram", {})
+
               for key, label in phases:
-                  def val(m):
-                      r = modes.get(m)
-                      if not r:
+                  def val(m_dict):
+                      if not m_dict:
                           return None
-                      return total(r) if key is None else r[key]
-                  b, a, z = val("baseline"), val("accelerated"), val("accelerated-zram")
+                      if key == "total_ms":
+                          if m_dict.get("total_ms") is not None and m_dict.get("total_ms") > 0:
+                              return m_dict["total_ms"]
+                          parts = [m_dict.get(k) for k in ["install_ms", "build_ms", "test_ms"] if m_dict.get(k) is not None]
+                          return sum(parts) if parts else None
+                      v = m_dict.get(key)
+                      return v if (v is not None and v > 0) else None
+
+                  b = val(base)
+                  a = val(acc)
+                  z = val(zram)
+
+                  if key != "total_ms" and b is None and a is None and z is None:
+                      continue
+
                   def cell(v):
                       return fmt(v) if v is not None else "n/a"
-                  def speed(v):
-                      return f"{b / v:.2f}x" if b and v else "-"
-                  out.append(f"| {project} | {label} | {cell(b)} | {cell(a)} | {speed(a)} | {cell(z)} | {speed(z)} |")
+
+                  def speed(v, baseline):
+                      if baseline and v and v > 0:
+                          ratio = baseline / v
+                          if ratio >= 1.05:
+                              return f"**{ratio:.2f}x**"
+                          return f"{ratio:.2f}x"
+                      return "-"
+
+                  out.append(
+                      f"| {project} | {label} | {cell(b)} | {cell(a)} | {speed(a, b)} | {cell(z)} | {speed(z, b)} |"
+                  )
+
           report = "\n".join(out)
           print(report)
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
-              f.write(report + "\n")
+
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_file:
+              try:
+                  with open(summary_file, "a", encoding="utf-8") as f:
+                      f.write(report + "\n")
+              except Exception as exc:
+                  print(f"Warning: could not write to GITHUB_STEP_SUMMARY: {exc}")
           PY
