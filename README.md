@@ -255,4 +255,4 @@ git push origin v1 --force
 
 ## License
 
-Released under the MIT License.
+Released under the [Business Source License 1.1](LICENSE) (BUSL-1.1). Free for internal commercial use; cannot be sold or incorporated into commercial products or services distributed to third parties. Converts to MIT on 2030-01-01.
