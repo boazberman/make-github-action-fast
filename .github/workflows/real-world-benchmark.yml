@@ -42,21 +42,21 @@ jobs:
             prefetch: 'cargo fetch --locked'
             install: ''
             build: 'cargo build --release --locked'
-            test: 'cargo test --lib --locked'
+            test: 'cargo test --workspace --locked'
           - name: fastapi
             repo: fastapi/fastapi
             ref: 0.115.4
-            prefetch: 'pip install uv && uv sync --frozen'
-            install: 'uv sync --frozen --offline'
+            prefetch: 'pip install uv && uv pip install -e ".[all]" --system'
+            install: 'uv pip install -e ".[all]" --offline --system'
             build: ''
-            test: 'uv run --no-sync pytest tests/test_tutorial -q'
+            test: 'pytest tests/test_tutorial -q'
           - name: redis
             repo: redis/redis
             ref: 7.2.5
             prefetch: ''
             install: ''
             build: 'make -j"$(nproc)"'
-            test: 'tclsh tests/test_helper.tcl --single unit/basic'
+            test: './runtest --single unit/type/string'
 
     steps:
       # The action lives in a subfolder so a zram workspace mount does not hide it.
