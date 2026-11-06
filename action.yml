@@ -1,5 +1,5 @@
 name: 'Overclock'
-description: 'Accelerate GitHub Actions Linux workflows with LD_PRELOAD fsync bypass, aggressive page-cache sysctl, ext4 remount, Git optimizations, and optional zram workspace with deferred spillover.'
+description: 'Accelerate GitHub Actions Linux workflows with LD_PRELOAD fsync bypass, aggressive page-cache sysctl, ext4 remount, Git optimizations, and zram swap.'
 author: 'boazberman'
 branding:
   icon: 'zap'
@@ -7,37 +7,69 @@ branding:
 
 inputs:
   fsync-bypass:
-    description: 'Bypass fsync, fdatasync, sync, msync, and strip O_SYNC/O_DSYNC flags via LD_PRELOAD libnosync.so.'
+    description: 'Compile and enable libnosync to bypass fsync, fdatasync, sync, msync, and strip O_SYNC/O_DSYNC flags.'
     required: false
     default: 'true'
+  preload-scope:
+    description: "'env' exports LD_PRELOAD via GITHUB_ENV. 'global' also writes /etc/ld.so.preload (covers sudo and new daemons, root only)."
+    required: false
+    default: 'env'
   page-cache-tuning:
-    description: 'Tune Linux kernel dirty page cache ratios and flush intervals (dirty_ratio=80, dirty_background_ratio=50, swappiness=10).'
+    description: 'Tune Linux kernel dirty page cache ratios and flush intervals (dirty_ratio=45, dirty_background_ratio=15, swappiness=10 or 100).'
     required: false
     default: 'true'
   remount-fast:
-    description: 'Remount ext4 filesystems (/ and /mnt) with noatime, nodiratime, barrier=0, and commit=600.'
+    description: 'Remount ext4 filesystems (/ and /mnt) with noatime, barrier=0, commit=60.'
     required: false
     default: 'true'
   git-tuning:
-    description: 'Apply high-performance git configurations (manyFiles, untrackedCache, multi-threading, disable auto-gc).'
+    description: 'Apply high-performance git configurations via environment variables (GIT_CONFIG_*).'
     required: false
     default: 'true'
-  zram-workspace:
-    description: 'Mount an in-memory compressed ext4 zram disk over the workspace to eliminate disk I/O.'
+  apt-tuning:
+    description: 'Configure dpkg force-unsafe-io, apt no languages, disable man-db auto-update, and stop apt background timers.'
+    required: false
+    default: 'true'
+  build-env:
+    description: 'Opt-in build environment tuning: MAKEFLAGS, CMAKE_BUILD_PARALLEL_LEVEL, CARGO_INCREMENTAL=0, CARGO_NET_GIT_FETCH_WITH_CLI, MALLOC_ARENA_MAX.'
     required: false
     default: 'false'
-  zram-size:
-    description: 'Size of the zram disk (e.g. 6G, 8G, 512M). Ignored if zram-workspace is false.'
+  zram-swap:
+    description: 'Add a compressed RAM swap device for memory headroom.'
     required: false
-    default: '6G'
-  spill-dirs:
-    description: 'Comma-separated directory names to bind-mount to /mnt/overclock-spill to prevent zram overflow. Only active when zram-workspace is true.'
+    default: 'false'
+  zram-swap-size:
+    description: 'Size of zram swap device: absolute (e.g. 4G, 512M) or percent of MemTotal (e.g. 50%).'
     required: false
-    default: 'node_modules,.cargo,.gradle,.venv,target'
+    default: '50%'
+  tmpfs-paths:
+    description: 'Comma-separated absolute paths to mount tmpfs over, copying existing contents into memory.'
+    required: false
+    default: ''
+  tmpfs-size:
+    description: 'Size for tmpfs mounts (percent or absolute, e.g. 50% or 4G).'
+    required: false
+    default: '50%'
+  self-hosted-unsafe:
+    description: 'On self-hosted runners: allow remount, system lib install, and setuid copy.'
+    required: false
+    default: 'false'
   summary:
     description: 'Emit a detailed performance, optimization, and I/O telemetry table to $GITHUB_STEP_SUMMARY.'
     required: false
     default: 'true'
+  zram-workspace:
+    description: 'DEPRECATED: alias for zram-swap.'
+    required: false
+    default: ''
+  zram-size:
+    description: 'DEPRECATED: alias for zram-swap-size.'
+    required: false
+    default: ''
+  spill-dirs:
+    description: 'DEPRECATED: ignored with a warning if non-empty.'
+    required: false
+    default: ''
 
 outputs:
   setup-time-ms:
@@ -45,10 +77,12 @@ outputs:
   fsync-bypass:
     description: "Status of fsync bypass ('active', 'disabled', or 'failed')."
   zram-device:
-    description: "Allocated zram device path (e.g. '/dev/zram0') or empty if not used."
+    description: "Allocated zram swap device path (e.g. '/dev/zram0') or empty if not used."
+  profile:
+    description: "Privilege profile ('hosted', 'self-hosted-safe', 'self-hosted-unsafe', or 'unprivileged')."
 
 runs:
-  using: 'node20'
+  using: 'node24'
   main: 'src/main.js'
   post: 'src/post.js'
   post-if: 'always()'

@@ -1,15 +1,16 @@
 {
   "name": "overclock",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Accelerate GitHub Actions Linux workflows with LD_PRELOAD fsync bypass, page-cache tuning, ext4 remount, git tuning, and zram workspace.",
+  "description": "Accelerate GitHub Actions Linux workflows with LD_PRELOAD fsync bypass, aggressive page-cache sysctl, ext4 remount, Git optimizations, and zram swap.",
   "main": "src/main.js",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "lint": "node --check src/main.js && node --check src/post.js && node --check src/common.js",
-    "build:lib": "gcc -O2 -shared -fPIC -U_FORTIFY_SOURCE -D_GNU_SOURCE -Wall -o libnosync.so src/nosync.c -ldl"
+    "test": "node --test \"test/*.test.js\"",
+    "lint": "node --check src/main.js && node --check src/post.js && node --check src/common.js && node --check test/common.test.js && node --check test/main.test.js && node --check test/post.test.js && node --check test/index.js",
+    "build:lib": "gcc -O2 -shared -fPIC -pthread -U_FORTIFY_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror -o libnosync.so src/nosync.c -ldl"
   },
   "repository": "boazberman/overclock",
   "license": "BUSL-1.1"

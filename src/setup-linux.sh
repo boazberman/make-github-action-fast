@@ -1,25 +1,31 @@
 #!/usr/bin/env bash
-# overclock - Linux root optimization engine
-# Modes: setup (default), spill-helper, teardown
+# overclock - Linux root optimization engine v2
+# Modes: setup (default), teardown
 
 set -uo pipefail
 
 OVERCLOCK_ACTION_PATH="${OVERCLOCK_ACTION_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+OVERCLOCK_PROFILE="${OVERCLOCK_PROFILE:-hosted}"
+OVERCLOCK_STATE_DIR="${OVERCLOCK_STATE_DIR:-/tmp/overclock}"
 OVERCLOCK_FSYNC_BYPASS="${OVERCLOCK_FSYNC_BYPASS:-true}"
+OVERCLOCK_PRELOAD_SCOPE="${OVERCLOCK_PRELOAD_SCOPE:-env}"
 OVERCLOCK_PAGE_CACHE="${OVERCLOCK_PAGE_CACHE:-true}"
 OVERCLOCK_REMOUNT="${OVERCLOCK_REMOUNT:-true}"
-OVERCLOCK_GIT_TUNING="${OVERCLOCK_GIT_TUNING:-true}"
-OVERCLOCK_ZRAM="${OVERCLOCK_ZRAM:-false}"
-OVERCLOCK_ZRAM_SIZE="${OVERCLOCK_ZRAM_SIZE:-6G}"
-OVERCLOCK_SPILL_DIRS="${OVERCLOCK_SPILL_DIRS:-node_modules,.cargo,.gradle,.venv,target}"
+OVERCLOCK_APT_TUNING="${OVERCLOCK_APT_TUNING:-true}"
+OVERCLOCK_ZRAM_SWAP="${OVERCLOCK_ZRAM_SWAP:-false}"
+OVERCLOCK_ZRAM_SWAP_SIZE="${OVERCLOCK_ZRAM_SWAP_SIZE:-50%}"
+OVERCLOCK_TMPFS_PATHS="${OVERCLOCK_TMPFS_PATHS:-}"
+OVERCLOCK_TMPFS_SIZE="${OVERCLOCK_TMPFS_SIZE:-50%}"
+OVERCLOCK_SELF_HOSTED_UNSAFE="${OVERCLOCK_SELF_HOSTED_UNSAFE:-false}"
 OVERCLOCK_WORKSPACE="${OVERCLOCK_WORKSPACE:-$(pwd)}"
 OVERCLOCK_UID="${OVERCLOCK_UID:-$(id -u)}"
 OVERCLOCK_GID="${OVERCLOCK_GID:-$(id -g)}"
-OVERCLOCK_STATE_FILE="${OVERCLOCK_STATE_FILE:-/tmp/overclock-state.env}"
-OVERCLOCK_METRICS_FILE="${OVERCLOCK_METRICS_FILE:-/tmp/overclock-metrics-start.env}"
-OVERCLOCK_LIB_FALLBACK_DIR="${OVERCLOCK_LIB_FALLBACK_DIR:-/tmp/overclock-lib}"
 OVERCLOCK_START_EPOCH_MS="${OVERCLOCK_START_EPOCH_MS:-}"
-OVERCLOCK_ARM_MODE="${OVERCLOCK_ARM_MODE:-any_entry}"
+
+STATE_FILE="$OVERCLOCK_STATE_DIR/state.env"
+METRICS_FILE="$OVERCLOCK_STATE_DIR/metrics-start.env"
+SETUP_LOG="$OVERCLOCK_STATE_DIR/setup.log"
+STATS_FILE="$OVERCLOCK_STATE_DIR/nosync-stats"
 
 IS_ROOT="false"
 if [[ "$(id -u)" -eq 0 ]]; then
@@ -27,168 +33,73 @@ if [[ "$(id -u)" -eq 0 ]]; then
 fi
 
 log() {
-  printf '[overclock] %s\n' "$1"
+  printf '[overclock] %s\n' "$1" | tee -a "$SETUP_LOG"
 }
 
 warn() {
   printf '::warning title=overclock::%s\n' "$1"
+  printf '[overclock WARNING] %s\n' "$1" >> "$SETUP_LOG"
 }
 
-state() {
-  printf '%s=%s\n' "$1" "$2" >> "$OVERCLOCK_STATE_FILE"
-}
-
-bind_spill_dir() {
-  local dir="$1"
-  local target="$OVERCLOCK_WORKSPACE/$dir"
-  local source="/mnt/overclock-spill/$dir"
-
-  if findmnt -rn -o TARGET --mountpoint "$target" >/dev/null 2>&1; then
-    return 0
-  fi
-
-  if [[ -d "$target" ]]; then
-    local entries=()
-    shopt -s nullglob dotglob
-    entries=("$target"/*)
-    shopt -u nullglob dotglob
-    if [[ ${#entries[@]} -gt 0 ]]; then
-      state "SPILL_SKIPPED" "$dir:non-empty"
-      return 0
-    fi
-  fi
-
-  mkdir -p "$target" 2>/dev/null || true
-  chown "$OVERCLOCK_UID:$OVERCLOCK_GID" "$target" 2>/dev/null || true
-
-  local p="$dir"
-  while [[ "$p" != "." && "$p" != "/" ]]; do
-    p="$(dirname "$p")"
-    if [[ "$p" != "." && "$p" != "/" && -d "$OVERCLOCK_WORKSPACE/$p" ]]; then
-      chown "$OVERCLOCK_UID:$OVERCLOCK_GID" "$OVERCLOCK_WORKSPACE/$p" 2>/dev/null || true
-    fi
-  done
-
-  if mount --bind "$source" "$target" 2>/dev/null; then
-    state "SPILL_BOUND" "$dir"
-  else
-    state "SPILL_SKIPPED" "$dir:mount-failed"
+record_status() {
+  local feat="$1"
+  local status="$2"
+  local detail="${3:-}"
+  printf '%s=%s\n' "$feat" "$status" >> "$STATE_FILE"
+  if [[ -n "$detail" ]]; then
+    printf '%s_DETAIL=%s\n' "$feat" "$detail" >> "$STATE_FILE"
   fi
 }
 
-mode_spill_helper() {
-  echo "$$" > /tmp/overclock-spill-helper.pid 2>/dev/null || true
-  local arm_mode="$OVERCLOCK_ARM_MODE"
-  local start_time
-  start_time="$(date +%s)"
-  local armed=0
+write_compile_result() {
+  local file="$1"
+  local status="$2"
+  local lib_path="$3"
+  local preload_val="$4"
+  local compile_ms="$5"
+  local scope="$6"
+  local installed_lib="${7:-}"
+  local orig_preload="${8:-}"
+  local err="${9:-}"
 
-  local fifo
-  fifo="$(mktemp -u /tmp/overclock-helper-fifo.XXXXXX)"
-  mkfifo "$fifo" 2>/dev/null || true
-  exec 3<>"$fifo" 2>/dev/null || true
-  rm -f "$fifo" 2>/dev/null || true
-
-  while true; do
-    local now
-    now="$(date +%s)"
-    local elapsed=$(( now - start_time ))
-
-    if [[ "$elapsed" -ge 3600 ]]; then
-      state "SPILL_HELPER" "timeout"
-      exec 3>&- 2>/dev/null || true
-      exit 0
-    fi
-
-    local src
-    src="$(findmnt -rn -o SOURCE --mountpoint "$OVERCLOCK_WORKSPACE" 2>/dev/null || true)"
-    if [[ ! "$src" =~ ^/dev/zram ]]; then
-      exec 3>&- 2>/dev/null || true
-      exit 0
-    fi
-
-    if [[ "$armed" -eq 0 ]]; then
-      if [[ "$arm_mode" == "any_entry" ]]; then
-        local entries=()
-        shopt -s nullglob dotglob
-        entries=("$OVERCLOCK_WORKSPACE"/*)
-        shopt -u nullglob dotglob
-        if [[ ${#entries[@]} -gt 0 ]]; then
-          armed=1
-        fi
-      elif [[ "$arm_mode" == "git_or_timeout" ]]; then
-        if [[ -e "$OVERCLOCK_WORKSPACE/.git" || "$elapsed" -ge 300 ]]; then
-          armed=1
-        fi
-      fi
-    fi
-
-    if [[ "$armed" -eq 1 ]]; then
-      local spill_array=()
-      IFS=',' read -r -a spill_array <<< "$OVERCLOCK_SPILL_DIRS"
-      for dir in "${spill_array[@]}"; do
-        [[ -n "$dir" ]] || continue
-        bind_spill_dir "$dir"
-      done
-      state "SPILL_HELPER" "done"
-      exec 3>&- 2>/dev/null || true
-      exit 0
-    fi
-
-    if [[ "$elapsed" -lt 600 ]]; then
-      read -r -t 0.05 -u 3 _ 2>/dev/null || true
-    else
-      read -r -t 1 -u 3 _ 2>/dev/null || true
-    fi
-  done
+  cat <<EOF > "$file"
+STATUS=$status
+LIB_PATH=$lib_path
+LD_PRELOAD_VALUE=$preload_val
+COMPILE_MS=$compile_ms
+PRELOAD_SCOPE=$scope
+INSTALLED_SYSTEM_LIB=$installed_lib
+ORIG_LD_SO_PRELOAD=$orig_preload
+ERR=$err
+EOF
 }
 
 mode_teardown() {
   log "Teardown initiated"
 
-  local helper_pid=""
-  if [[ -f /tmp/overclock-spill-helper.pid ]]; then
-    read -r helper_pid < /tmp/overclock-spill-helper.pid 2>/dev/null || true
-  fi
-  if [[ -n "$helper_pid" ]]; then
-    if kill -0 "$helper_pid" 2>/dev/null; then
-      kill -TERM "$helper_pid" 2>/dev/null || true
-      sleep 0.05 2>/dev/null || true
-      if kill -0 "$helper_pid" 2>/dev/null; then
-        kill -9 "$helper_pid" 2>/dev/null || true
-      fi
-    fi
-    rm -f /tmp/overclock-spill-helper.pid 2>/dev/null || true
-  fi
-
-  local bound_dirs=()
-  local zram_dev=""
   local orig_sysctl=""
-  if [[ -f "$OVERCLOCK_STATE_FILE" ]]; then
+  local remounted_mounts=""
+  local man_db_existed=""
+  local orig_preload=""
+  local tmpfs_mounted=""
+  local zram_dev=""
+  local installed_lib=""
+
+  if [[ -f "$STATE_FILE" ]]; then
     while IFS='=' read -r k v || [[ -n "$k" ]]; do
       case "$k" in
-        SPILL_BOUND) bound_dirs+=("$v") ;;
-        ZRAM_DEV) zram_dev="$v" ;;
         ORIG_SYSCTL) orig_sysctl="$v" ;;
+        REMOUNTED_MOUNTS) remounted_mounts="$v" ;;
+        MAN_DB_AUTO_UPDATE_EXISTED) man_db_existed="$v" ;;
+        ORIG_LD_SO_PRELOAD) orig_preload="$v" ;;
+        TMPFS_MOUNTED) tmpfs_mounted="$v" ;;
+        ZRAM_DEV) zram_dev="$v" ;;
+        INSTALLED_SYSTEM_LIB) installed_lib="$v" ;;
       esac
-    done < "$OVERCLOCK_STATE_FILE"
+    done < "$STATE_FILE"
   fi
 
-  for dir in "${bound_dirs[@]}"; do
-    [[ -n "$dir" ]] || continue
-    umount -l "$OVERCLOCK_WORKSPACE/$dir" 2>/dev/null || true
-  done
-
-  local src
-  src="$(findmnt -rn -o SOURCE --mountpoint "$OVERCLOCK_WORKSPACE" 2>/dev/null || true)"
-  if [[ "$src" =~ ^/dev/zram ]]; then
-    umount -l "$OVERCLOCK_WORKSPACE" 2>/dev/null || true
-  fi
-
-  if [[ -n "$zram_dev" && -b "$zram_dev" ]]; then
-    zramctl --reset "$zram_dev" 2>/dev/null || true
-  fi
-
+  # 1. Restore sysctls
   if [[ -n "$orig_sysctl" ]]; then
     local pairs=()
     IFS=',' read -r -a pairs <<< "$orig_sysctl"
@@ -197,9 +108,54 @@ mode_teardown() {
       local v="${pair#*:}"
       local p="/proc/sys/${k//.//}"
       if [[ -w "$p" ]]; then
-        printf '%s' "$v" > "$p" 2>/dev/null || true
+        printf '%s' "$v" > "$p" 2>>"$SETUP_LOG" || true
       fi
     done
+  fi
+
+  # 2. Restore remounts
+  if [[ -n "$remounted_mounts" ]]; then
+    local m_array=()
+    IFS=' ' read -r -a m_array <<< "$remounted_mounts"
+    for mp in "${m_array[@]}"; do
+      [[ -n "$mp" ]] || continue
+      mount -o remount,barrier=1,commit=5,relatime "$mp" 2>>"$SETUP_LOG" || true
+    done
+  fi
+
+  # 3. Restore apt configuration
+  rm -f /etc/dpkg/dpkg.cfg.d/overclock-unsafe-io /etc/apt/apt.conf.d/99overclock 2>>"$SETUP_LOG" || true
+  if [[ "$man_db_existed" == "true" ]]; then
+    touch /var/lib/man-db/auto-update 2>>"$SETUP_LOG" || true
+  fi
+  systemctl start --no-block apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>>"$SETUP_LOG" || true
+
+  # 4. Restore /etc/ld.so.preload
+  if [[ "$orig_preload" == "present" && -f "$OVERCLOCK_STATE_DIR/orig_ld_so_preload" ]]; then
+    cp "$OVERCLOCK_STATE_DIR/orig_ld_so_preload" /etc/ld.so.preload 2>>"$SETUP_LOG" || true
+  elif [[ "$orig_preload" == "absent" ]]; then
+    rm -f /etc/ld.so.preload 2>>"$SETUP_LOG" || true
+  fi
+
+  # 5. Unmount tmpfs
+  if [[ -n "$tmpfs_mounted" ]]; then
+    local t_array=()
+    IFS=',' read -r -a t_array <<< "$tmpfs_mounted"
+    for p in "${t_array[@]}"; do
+      [[ -n "$p" ]] || continue
+      umount -l "$p" 2>>"$SETUP_LOG" || true
+    done
+  fi
+
+  # 6. Reset zram swap
+  if [[ -n "$zram_dev" && -b "$zram_dev" ]]; then
+    swapoff "$zram_dev" 2>>"$SETUP_LOG" || true
+    zramctl --reset "$zram_dev" 2>>"$SETUP_LOG" || true
+  fi
+
+  # 7. Remove installed system lib
+  if [[ -n "$installed_lib" && -f "$installed_lib" ]]; then
+    rm -f "$installed_lib" 2>>"$SETUP_LOG" || true
   fi
 
   log "Teardown complete"
@@ -210,25 +166,30 @@ mode_setup() {
   local script_start_ms
   script_start_ms="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
 
-  # Truncate and prep state file
-  : > "$OVERCLOCK_STATE_FILE"
-  chmod 0644 "$OVERCLOCK_STATE_FILE" 2>/dev/null || true
+  mkdir -p "$OVERCLOCK_STATE_DIR" "$OVERCLOCK_STATE_DIR/lib" 2>/dev/null || true
+  : > "$SETUP_LOG"
+  : > "$STATE_FILE"
+  chmod 0644 "$STATE_FILE" 2>>"$SETUP_LOG" || true
+
+  # Create empty stats file with mode 0666
+  if [[ ! -f "$STATS_FILE" ]]; then
+    : > "$STATS_FILE"
+  fi
+  chmod 0666 "$STATS_FILE" 2>>"$SETUP_LOG" || true
 
   # 1. Baseline telemetry -> metrics file
-  : > "$OVERCLOCK_METRICS_FILE"
-  chmod 0644 "$OVERCLOCK_METRICS_FILE" 2>/dev/null || true
+  : > "$METRICS_FILE"
+  chmod 0644 "$METRICS_FILE" 2>>"$SETUP_LOG" || true
 
   local start_epoch="$OVERCLOCK_START_EPOCH_MS"
   if [[ -z "$start_epoch" ]]; then
     start_epoch="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
   fi
-  printf 'START_EPOCH_MS=%s\n' "$start_epoch" >> "$OVERCLOCK_METRICS_FILE"
 
   local start_uptime="0"
   if [[ -r /proc/uptime ]]; then
     read -r start_uptime _ < /proc/uptime || true
   fi
-  printf 'START_UPTIME=%s\n' "$start_uptime" >> "$OVERCLOCK_METRICS_FILE"
 
   local cpu_stat=""
   if [[ -r /proc/stat ]]; then
@@ -239,10 +200,15 @@ mode_setup() {
       fi
     done < /proc/stat
   fi
-  printf 'CPU_STAT=%s\n' "$cpu_stat" >> "$OVERCLOCK_METRICS_FILE"
+
+  {
+    printf 'START_EPOCH_MS=%s\n' "$start_epoch"
+    printf 'START_UPTIME=%s\n' "$start_uptime"
+    printf 'CPU_STAT=%s\n' "$cpu_stat"
+  } >> "$METRICS_FILE"
 
   if [[ -r /proc/vmstat ]]; then
-    awk '$1 ~ /^(pgpgin|pgpgout|pswpin|pswpout|nr_dirtied|nr_written|pgmajfault|oom_kill)$/ { print "VMSTAT_" $1 "=" $2 }' /proc/vmstat >> "$OVERCLOCK_METRICS_FILE" || true
+    awk '$1 ~ /^(pgpgin|pgpgout|pswpin|pswpout|nr_dirtied|nr_written|pgmajfault|oom_kill)$/ { print "VMSTAT_" $1 "=" $2 }' /proc/vmstat >> "$METRICS_FILE" 2>>"$SETUP_LOG" || true
   fi
 
   local devs=()
@@ -263,7 +229,7 @@ mode_setup() {
   if [[ ${#devs[@]} -gt 0 ]]; then
     disk_devs=$(IFS=,; echo "${devs[*]}")
   fi
-  printf 'DISK_DEVICES=%s\n' "$disk_devs" >> "$OVERCLOCK_METRICS_FILE"
+  printf 'DISK_DEVICES=%s\n' "$disk_devs" >> "$METRICS_FILE"
 
   if [[ -n "$disk_devs" && -r /proc/diskstats ]]; then
     awk -v devs="$disk_devs" '
@@ -285,197 +251,133 @@ mode_setup() {
       print "DISK_WRITE_IOS=" w_ios;
       print "DISK_WRITE_SECTORS=" w_sec;
       print "DISK_IO_TICKS_MS=" ticks;
-    }' /proc/diskstats >> "$OVERCLOCK_METRICS_FILE" || true
+    }' /proc/diskstats >> "$METRICS_FILE" 2>>"$SETUP_LOG" || true
   else
-    printf 'DISK_READ_IOS=0\nDISK_READ_SECTORS=0\nDISK_WRITE_IOS=0\nDISK_WRITE_SECTORS=0\nDISK_IO_TICKS_MS=0\n' >> "$OVERCLOCK_METRICS_FILE"
+    printf 'DISK_READ_IOS=0\nDISK_READ_SECTORS=0\nDISK_WRITE_IOS=0\nDISK_WRITE_SECTORS=0\nDISK_IO_TICKS_MS=0\n' >> "$METRICS_FILE"
   fi
 
-  # 2. Background libnosync build
+  # 2. Background libnosync compile & preload setup
   local compile_pid=""
   local build_tmp=""
   local compile_result=""
 
   if [[ "$OVERCLOCK_FSYNC_BYPASS" == "true" ]]; then
-    build_tmp="$(mktemp -d /tmp/overclock-build.XXXXXX 2>/dev/null || true)"
+    build_tmp="$(mktemp -d /tmp/overclock-build.XXXXXX 2>>"$SETUP_LOG" || true)"
     if [[ -n "$build_tmp" && -d "$build_tmp" ]]; then
       compile_result="$build_tmp/result.env"
       local nosync_src="$OVERCLOCK_ACTION_PATH/src/nosync.c"
-      if [[ -r "$nosync_src" ]]; then
-        cp "$nosync_src" "$build_tmp/nosync.c" 2>/dev/null || true
-      fi
 
       (
         local t_cstart
         t_cstart="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
 
-        if [[ ! -r "$build_tmp/nosync.c" ]]; then
+        if [[ ! -r "$nosync_src" ]]; then
           local t_cend
           t_cend="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
-          cat <<EOF > "$compile_result"
-STATUS=failed
-ERR=nosync.c not found
-COMPILE_MS=$(( t_cend - t_cstart ))
-EOF
+          write_compile_result "$compile_result" "failed" "" "" "$(( t_cend - t_cstart ))" "env" "" "" "nosync.c not found"
           exit 0
         fi
 
         if ! command -v gcc >/dev/null 2>&1; then
           local t_cend
           t_cend="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
-          cat <<EOF > "$compile_result"
-STATUS=failed
-ERR=gcc not found
-COMPILE_MS=$(( t_cend - t_cstart ))
-EOF
+          write_compile_result "$compile_result" "failed" "" "" "$(( t_cend - t_cstart ))" "env" "" "" "gcc not found"
           exit 0
         fi
 
         local tmp_so="$build_tmp/libnosync.so"
-        if ! gcc -O2 -shared -fPIC -U_FORTIFY_SOURCE -D_GNU_SOURCE -Wall -o "$tmp_so" "$build_tmp/nosync.c" -ldl; then
+        if ! gcc -O2 -shared -fPIC -pthread -U_FORTIFY_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror -o "$tmp_so" "$nosync_src" -ldl >>"$SETUP_LOG" 2>&1; then
           local t_cend
           t_cend="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
-          cat <<EOF > "$compile_result"
-STATUS=failed
-ERR=gcc compilation failed
-COMPILE_MS=$(( t_cend - t_cstart ))
-EOF
+          write_compile_result "$compile_result" "failed" "" "" "$(( t_cend - t_cstart ))" "env" "" "" "gcc compilation failed"
           exit 0
         fi
 
-        if [[ "$IS_ROOT" == "true" ]]; then
-          mkdir -p /usr/local/lib 2>/dev/null || true
-          if ! install -m 0755 "$tmp_so" /usr/local/lib/libnosync.so 2>/dev/null; then
-            local t_cend
-            t_cend="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
-            cat <<EOF > "$compile_result"
-STATUS=failed
-ERR=install to /usr/local/lib failed
-COMPILE_MS=$(( t_cend - t_cstart ))
-EOF
-            exit 0
-          fi
+        local lib_path=""
+        local preload_val=""
+        local installed_system_lib=""
 
-          local triplet
-          triplet="$(gcc -dumpmachine 2>/dev/null || true)"
+        if [[ "$IS_ROOT" == "true" && ( "$OVERCLOCK_PROFILE" == "hosted" || "$OVERCLOCK_PROFILE" == "self-hosted-unsafe" ) ]]; then
+          local triplet=""
+          triplet="$(gcc -dumpmachine 2>>"$SETUP_LOG" || true)"
           if [[ -n "$triplet" && -d "/usr/lib/$triplet" ]]; then
-            install -m 4755 "$tmp_so" "/usr/lib/$triplet/libnosync.so" 2>/dev/null || true
+            if install -m 4755 "$tmp_so" "/usr/lib/$triplet/libnosync.so" 2>>"$SETUP_LOG"; then
+              lib_path="/usr/lib/$triplet/libnosync.so"
+              preload_val="libnosync.so"
+              installed_system_lib="/usr/lib/$triplet/libnosync.so"
+            fi
           fi
-
-          mkdir -p /etc/ld.so.conf.d 2>/dev/null || true
-          printf '/usr/local/lib\n' > /etc/ld.so.conf.d/nosync.conf 2>/dev/null || true
-          setsid ldconfig </dev/null >/dev/null 2>&1 &
-
-          local t_cend
-          t_cend="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
-          cat <<EOF > "$compile_result"
-STATUS=active
-LIB_PATH=/usr/local/lib/libnosync.so
-LD_PRELOAD_VALUE=libnosync.so
-COMPILE_MS=$(( t_cend - t_cstart ))
-EOF
+          if [[ -z "$lib_path" ]]; then
+            if install -m 0755 "$tmp_so" "$OVERCLOCK_STATE_DIR/lib/libnosync.so" 2>>"$SETUP_LOG"; then
+              lib_path="$OVERCLOCK_STATE_DIR/lib/libnosync.so"
+              preload_val="$OVERCLOCK_STATE_DIR/lib/libnosync.so"
+            fi
+          fi
         else
-          mkdir -p "$OVERCLOCK_LIB_FALLBACK_DIR" 2>/dev/null || true
-          if ! install -m 0755 "$tmp_so" "$OVERCLOCK_LIB_FALLBACK_DIR/libnosync.so" 2>/dev/null; then
-            local t_cend
-            t_cend="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
-            cat <<EOF > "$compile_result"
-STATUS=failed
-ERR=install to fallback dir failed
-COMPILE_MS=$(( t_cend - t_cstart ))
-EOF
-            exit 0
+          if install -m 0755 "$tmp_so" "$OVERCLOCK_STATE_DIR/lib/libnosync.so" 2>>"$SETUP_LOG"; then
+            lib_path="$OVERCLOCK_STATE_DIR/lib/libnosync.so"
+            preload_val="$OVERCLOCK_STATE_DIR/lib/libnosync.so"
           fi
+        fi
 
+        if [[ -z "$lib_path" ]]; then
           local t_cend
           t_cend="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
-          cat <<EOF > "$compile_result"
-STATUS=active
-LIB_PATH=$OVERCLOCK_LIB_FALLBACK_DIR/libnosync.so
-LD_PRELOAD_VALUE=$OVERCLOCK_LIB_FALLBACK_DIR/libnosync.so
-COMPILE_MS=$(( t_cend - t_cstart ))
-EOF
+          write_compile_result "$compile_result" "failed" "" "" "$(( t_cend - t_cstart ))" "env" "" "" "installation of libnosync.so failed"
+          exit 0
         fi
-      ) >"$build_tmp/compile.log" 2>&1 &
+
+        local scope_result="env"
+        local orig_preload_state=""
+        if [[ "$OVERCLOCK_PRELOAD_SCOPE" == "global" && "$IS_ROOT" == "true" && ( "$OVERCLOCK_PROFILE" == "hosted" || "$OVERCLOCK_PROFILE" == "self-hosted-unsafe" ) ]]; then
+          if [[ -f /etc/ld.so.preload ]]; then
+            cp /etc/ld.so.preload "$OVERCLOCK_STATE_DIR/orig_ld_so_preload" 2>>"$SETUP_LOG" || true
+            orig_preload_state="present"
+          else
+            orig_preload_state="absent"
+          fi
+          printf '%s\n' "$lib_path" >> /etc/ld.so.preload 2>>"$SETUP_LOG" || true
+          scope_result="global"
+        fi
+
+        local t_cend
+        t_cend="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
+        write_compile_result "$compile_result" "active" "$lib_path" "$preload_val" "$(( t_cend - t_cstart ))" "$scope_result" "$installed_system_lib" "$orig_preload_state" ""
+      ) >>"$SETUP_LOG" 2>&1 &
       compile_pid=$!
     else
       warn "failed to create temp dir for libnosync build"
     fi
   fi
 
-  # 3. Bloat suppression, CPU governor, and block queue optimizations
-  systemctl stop --no-block apt-daily.timer apt-daily-upgrade.timer fstrim.timer sysstat.timer unattended-upgrades.service multipathd.service multipathd.socket 2>/dev/null || true
-
-  for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-    [[ -w "$gov" ]] && printf 'performance' > "$gov" 2>/dev/null || true
-  done
-
-  for b in /sys/block/*; do
-    [[ -e "$b" ]] || continue
-    case "${b##*/}" in
-      loop*|ram*|zram*|sr*|fd*|nbd*) continue ;;
-    esac
-    [[ -w "$b/queue/scheduler" ]] && echo none > "$b/queue/scheduler" 2>/dev/null || true
-    [[ -w "$b/queue/nr_requests" ]] && echo 512 > "$b/queue/nr_requests" 2>/dev/null || true
-    [[ -w "$b/queue/rq_affinity" ]] && echo 2 > "$b/queue/rq_affinity" 2>/dev/null || true
-    [[ -w "$b/queue/add_random" ]] && echo 0 > "$b/queue/add_random" 2>/dev/null || true
-    [[ -w "$b/queue/rotational" ]] && echo 0 > "$b/queue/rotational" 2>/dev/null || true
-  done
-
-  # 4. Page cache and sysctl tuning
+  # 3. Page cache tuning
   if [[ "$OVERCLOCK_PAGE_CACHE" != "true" ]]; then
-    state PAGE_CACHE "disabled"
+    record_status PAGE_CACHE "disabled"
   elif [[ "$IS_ROOT" != "true" ]]; then
-    state PAGE_CACHE "skipped"
+    record_status PAGE_CACHE "skipped" "non-root"
   else
     local sysctl_keys=(
       "vm.dirty_ratio"
       "vm.dirty_background_ratio"
       "vm.dirty_expire_centisecs"
       "vm.dirty_writeback_centisecs"
+      "vm.vfs_cache_pressure"
       "vm.swappiness"
       "fs.inotify.max_user_watches"
-      "kernel.sched_migration_cost_ns"
-      "kernel.sched_autogroup_enabled"
-      "kernel.numa_balancing"
-      "vm.overcommit_memory"
-      "vm.vfs_cache_pressure"
-      "fs.file-max"
-      "net.core.somaxconn"
-      "net.ipv4.tcp_max_syn_backlog"
-      "net.ipv4.tcp_tw_reuse"
-      "net.ipv4.ip_local_port_range"
-      "net.ipv4.tcp_fin_timeout"
-      "net.core.netdev_max_backlog"
-      "net.core.rmem_max"
-      "net.core.wmem_max"
-      "net.ipv4.tcp_rmem"
-      "net.ipv4.tcp_wmem"
-      "net.ipv4.tcp_fastopen"
     )
+    local swappiness_val="10"
+    if [[ "$OVERCLOCK_ZRAM_SWAP" == "true" ]]; then
+      swappiness_val="100"
+    fi
+
     local sysctl_vals=(
-      "80"
-      "50"
-      "60000"
-      "6000"
-      "10"
-      "1048576"
-      "5000000"
-      "0"
-      "0"
-      "1"
-      "50"
-      "2097152"
-      "65535"
-      "65535"
-      "1"
-      "1024 65535"
+      "45"
       "15"
-      "10000"
-      "16777216"
-      "16777216"
-      "4096 87380 16777216"
-      "4096 65536 16777216"
-      "3"
+      "3000"
+      "1500"
+      "50"
+      "$swappiness_val"
+      "1048576"
     )
 
     local orig_pairs=()
@@ -483,14 +385,14 @@ EOF
       local p="/proc/sys/${k//.//}"
       if [[ -r "$p" ]]; then
         local cur_val=""
-        read -r cur_val < "$p" 2>/dev/null || cur_val=""
+        read -r cur_val < "$p" 2>>"$SETUP_LOG" || cur_val=""
         orig_pairs+=("$k:$cur_val")
       fi
     done
     if [[ ${#orig_pairs[@]} -gt 0 ]]; then
       local orig_str
       orig_str=$(IFS=,; echo "${orig_pairs[*]}")
-      state ORIG_SYSCTL "$orig_str"
+      printf 'ORIG_SYSCTL=%s\n' "$orig_str" >> "$STATE_FILE"
     fi
 
     local success_cnt=0
@@ -502,124 +404,128 @@ EOF
       if [[ ! -e "$p" ]]; then
         continue
       fi
-      if printf '%s' "$v" > "$p" 2>/dev/null; then
+
+      if [[ "$k" == "fs.inotify.max_user_watches" ]]; then
+        local cur_watches=0
+        read -r cur_watches < "$p" 2>>"$SETUP_LOG" || cur_watches=0
+        if [[ "$cur_watches" -ge 1048576 ]]; then
+          ((success_cnt++)) || true
+          continue
+        fi
+      fi
+
+      if printf '%s' "$v" > "$p" 2>>"$SETUP_LOG"; then
         ((success_cnt++)) || true
       else
         ((fail_cnt++)) || true
       fi
     done
 
-    # THP defrag
-    [[ -w /sys/kernel/mm/transparent_hugepage/defrag ]] && echo 'defer+madvise' > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
-
-    # TCP BBR congestion control
-    modprobe tcp_bbr 2>/dev/null || true
-    sysctl -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
-
     if [[ "$fail_cnt" -eq 0 ]]; then
-      state PAGE_CACHE "active"
+      record_status PAGE_CACHE "active"
     elif [[ "$success_cnt" -gt 0 ]]; then
-      state PAGE_CACHE "partial"
+      record_status PAGE_CACHE "partial"
     else
-      state PAGE_CACHE "failed"
+      record_status PAGE_CACHE "failed"
     fi
   fi
 
-  # 5. Remount
+  # 4. Filesystem remount
   if [[ "$OVERCLOCK_REMOUNT" != "true" ]]; then
-    state REMOUNT "disabled"
+    record_status REMOUNT "disabled"
   elif [[ "$IS_ROOT" != "true" ]]; then
-    state REMOUNT "skipped"
+    record_status REMOUNT "skipped" "non-root"
+  elif [[ "$OVERCLOCK_PROFILE" == "self-hosted-safe" ]]; then
+    record_status REMOUNT "skipped" "self-hosted-safe"
   else
+    local remounted=()
     local remount_details=()
-    local any_active=0
-    local any_partial=0
-    local any_failed=0
     local any_ext4=0
 
     for mp in / /mnt; do
       local fstype
-      fstype="$(findmnt -rn -o FSTYPE --mountpoint "$mp" 2>/dev/null || true)"
+      fstype="$(findmnt -rn -o FSTYPE --mountpoint "$mp" 2>>"$SETUP_LOG" || true)"
       if [[ -z "$fstype" ]]; then
         remount_details+=("$mp:absent")
       elif [[ "$fstype" != "ext4" ]]; then
         remount_details+=("$mp:not-ext4:$fstype")
       else
         any_ext4=1
-        if mount -o remount,noatime,nodiratime,barrier=0,commit=600 "$mp" 2>/dev/null; then
+        if mount -o remount,noatime,barrier=0,commit=60 "$mp" 2>>"$SETUP_LOG"; then
           remount_details+=("$mp:ok")
-          any_active=1
-        elif mount -o remount,noatime,commit=600 "$mp" 2>/dev/null; then
-          remount_details+=("$mp:partial")
-          any_partial=1
+          remounted+=("$mp")
         else
           remount_details+=("$mp:failed")
-          any_failed=1
         fi
       fi
     done
 
-    local remount_status="skipped"
-    if [[ "$any_ext4" -eq 1 ]]; then
-      if [[ "$any_failed" -eq 1 && "$any_active" -eq 0 && "$any_partial" -eq 0 ]]; then
-        remount_status="failed"
-      elif [[ "$any_partial" -eq 1 || "$any_failed" -eq 1 ]]; then
-        remount_status="partial"
-      else
-        remount_status="active"
-      fi
-    fi
-
     local detail_str
     detail_str=$(IFS=';'; echo "${remount_details[*]}")
-    state REMOUNT "$remount_status"
-    state REMOUNT_DETAIL "$detail_str"
+    if [[ ${#remounted[@]} -gt 0 ]]; then
+      record_status REMOUNT "active" "$detail_str"
+      printf 'REMOUNTED_MOUNTS=%s\n' "${remounted[*]}" >> "$STATE_FILE"
+    elif [[ "$any_ext4" -eq 1 ]]; then
+      record_status REMOUNT "failed" "$detail_str"
+    else
+      record_status REMOUNT "skipped" "$detail_str"
+    fi
   fi
 
-  # 6. zram workspace
-  local zram_active=0
-  local arm_mode="any_entry"
-  local ws_had_files=0
-  local ws_had_git=0
-
-  if [[ "$OVERCLOCK_ZRAM" != "true" ]]; then
-    state ZRAM "disabled"
-    state ZRAM_DEV ""
-    state ZRAM_SIZE ""
-    state ZRAM_ALGO ""
-    state ZRAM_DETAIL ""
+  # 5. Apt tuning
+  if [[ "$OVERCLOCK_APT_TUNING" != "true" ]]; then
+    record_status APT_TUNING "disabled"
   elif [[ "$IS_ROOT" != "true" ]]; then
-    warn "zram workspace requires root privileges; skipping"
-    state ZRAM "skipped"
-    state ZRAM_DEV ""
-    state ZRAM_SIZE ""
-    state ZRAM_ALGO ""
-    state ZRAM_DETAIL "requires root"
+    record_status APT_TUNING "skipped" "non-root"
   else
-    local existing_src
-    existing_src="$(findmnt -rn -o SOURCE --mountpoint "$OVERCLOCK_WORKSPACE" 2>/dev/null || true)"
-    if [[ "$existing_src" =~ ^/dev/zram ]]; then
-      state ZRAM "active"
-      state ZRAM_DEV "$existing_src"
-      state ZRAM_SIZE ""
-      state ZRAM_ALGO ""
-      state ZRAM_DETAIL "reused existing mount"
-      zram_active=1
+    mkdir -p /etc/dpkg/dpkg.cfg.d /etc/apt/apt.conf.d 2>>"$SETUP_LOG" || true
+    printf 'force-unsafe-io\n' > /etc/dpkg/dpkg.cfg.d/overclock-unsafe-io 2>>"$SETUP_LOG" || true
+    printf 'Acquire::Languages "none";\n' > /etc/apt/apt.conf.d/99overclock 2>>"$SETUP_LOG" || true
+
+    if [[ -e /var/lib/man-db/auto-update ]]; then
+      printf 'MAN_DB_AUTO_UPDATE_EXISTED=true\n' >> "$STATE_FILE"
+      rm -f /var/lib/man-db/auto-update 2>>"$SETUP_LOG" || true
     else
-      # Check size vs physical memory
-      local mem_total_kb=0
-      if [[ -r /proc/meminfo ]]; then
-        while IFS=':' read -r mk mv || [[ -n "$mk" ]]; do
-          if [[ "$mk" == "MemTotal" ]]; then
-            mem_total_kb="$(awk '{print $1}' <<< "$mv")"
-            break
-          fi
-        done < /proc/meminfo
+      printf 'MAN_DB_AUTO_UPDATE_EXISTED=false\n' >> "$STATE_FILE"
+    fi
+
+    systemctl stop --no-block apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>>"$SETUP_LOG" || true
+    record_status APT_TUNING "active"
+  fi
+
+  # 6. zram swap
+  if [[ "$OVERCLOCK_ZRAM_SWAP" != "true" ]]; then
+    record_status ZRAM_SWAP "disabled"
+  elif [[ "$IS_ROOT" != "true" ]]; then
+    record_status ZRAM_SWAP "skipped" "non-root"
+  else
+    modprobe zram 2>>"$SETUP_LOG" || true
+    if [[ ! -e /sys/class/zram-control && ! -e /dev/zram0 ]]; then
+      warn "zram kernel module not available or unsupported in this kernel"
+      record_status ZRAM_SWAP "unsupported" "module unavailable"
+    else
+      # Calculate swap size in bytes
+      local size_bytes=0
+      if [[ "$OVERCLOCK_ZRAM_SWAP_SIZE" =~ ^([0-9]+)%$ ]]; then
+        local pct="${BASH_REMATCH[1]}"
+        local mem_total_kb=0
+        if [[ -r /proc/meminfo ]]; then
+          while IFS=':' read -r mk mv || [[ -n "$mk" ]]; do
+            if [[ "$mk" == "MemTotal" ]]; then
+              mem_total_kb="$(awk '{print $1}' <<< "$mv")"
+              break
+            fi
+          done < /proc/meminfo
+        fi
+        if [[ "$mem_total_kb" -gt 0 ]]; then
+          local mem_total_bytes=$(( mem_total_kb * 1024 ))
+          size_bytes=$(( mem_total_bytes * pct / 100 ))
+        fi
       fi
 
-      if [[ "$mem_total_kb" -gt 0 ]]; then
-        local zram_bytes
-        zram_bytes="$(awk -v s="$OVERCLOCK_ZRAM_SIZE" 'BEGIN {
+      if [[ "$size_bytes" -le 0 ]]; then
+        # Parse absolute sizes like 4G, 512M
+        size_bytes="$(awk -v s="$OVERCLOCK_ZRAM_SWAP_SIZE" 'BEGIN {
           u = toupper(substr(s, length(s)));
           n = s;
           mult = 1;
@@ -629,200 +535,112 @@ EOF
           else if (u == "T") { mult = 1024*1024*1024*1024; n = substr(s, 1, length(s)-1); }
           printf "%.0f", n * mult;
         }')"
-        local mem_limit_bytes=$(( mem_total_kb * 1024 * 2 ))
-        if [[ "$zram_bytes" -gt "$mem_limit_bytes" ]]; then
-          warn "zram size ($OVERCLOCK_ZRAM_SIZE) exceeds 2x physical RAM"
-        fi
       fi
 
-      modprobe zram 2>/dev/null || true
-      if [[ ! -e /sys/class/zram-control && ! -e /dev/zram0 ]]; then
-        warn "zram kernel module not available or unsupported in this kernel"
-        state ZRAM "unsupported"
-        state ZRAM_DEV ""
-        state ZRAM_SIZE ""
-        state ZRAM_ALGO ""
-        state ZRAM_DETAIL "unsupported kernel"
-      else
-        local zram_dev=""
-        local zram_algo=""
-        for algo in lz4 lzo-rle ""; do
-          if [[ -n "$algo" ]]; then
-            zram_dev="$(zramctl --find --size "$OVERCLOCK_ZRAM_SIZE" --algorithm "$algo" 2>/dev/null || true)"
-            if [[ -n "$zram_dev" ]]; then
-              zram_algo="$algo"
-              break
-            fi
-          else
-            zram_dev="$(zramctl --find --size "$OVERCLOCK_ZRAM_SIZE" 2>/dev/null || true)"
-            if [[ -n "$zram_dev" ]]; then
-              zram_algo="default"
-              break
-            fi
+      local zram_dev=""
+      local zram_algo=""
+      for algo in zstd lz4 lzo-rle ""; do
+        if [[ -n "$algo" ]]; then
+          zram_dev="$(zramctl --find --size "$size_bytes" --algorithm "$algo" 2>>"$SETUP_LOG" || true)"
+          if [[ -n "$zram_dev" ]]; then
+            zram_algo="$algo"
+            break
           fi
-        done
-
-        if [[ -z "$zram_dev" ]]; then
-          warn "zramctl failed to allocate a zram device"
-          state ZRAM "failed"
-          state ZRAM_DEV ""
-          state ZRAM_SIZE ""
-          state ZRAM_ALGO ""
-          state ZRAM_DETAIL "allocation failed"
         else
-          if ! mkfs.ext4 -q -F -m 0 -O ^has_journal -E discard "$zram_dev" 2>/dev/null; then
-            warn "mkfs.ext4 failed on $zram_dev"
-            zramctl --reset "$zram_dev" 2>/dev/null || true
-            state ZRAM "failed"
-            state ZRAM_DEV ""
-            state ZRAM_SIZE ""
-            state ZRAM_ALGO ""
-            state ZRAM_DETAIL "mkfs.ext4 failed"
-          else
-            local preserve_dir=""
-            if [[ -d "$OVERCLOCK_WORKSPACE" ]]; then
-              if [[ -e "$OVERCLOCK_WORKSPACE/.git" ]]; then
-                ws_had_git=1
-              fi
-              local ws_items=()
-              shopt -s nullglob dotglob
-              ws_items=("$OVERCLOCK_WORKSPACE"/*)
-              shopt -u nullglob dotglob
-              if [[ ${#ws_items[@]} -gt 0 ]]; then
-                ws_had_files=1
-                preserve_dir="$(dirname "$OVERCLOCK_WORKSPACE")/.overclock-preserve.$$"
-                mkdir -p "$preserve_dir" 2>/dev/null || true
-                find "$OVERCLOCK_WORKSPACE" -mindepth 1 -maxdepth 1 -exec mv -t "$preserve_dir" -- {} + 2>/dev/null || true
-              fi
-            fi
-
-            mkdir -p "$OVERCLOCK_WORKSPACE" 2>/dev/null || true
-            if ! mount -o noatime,barrier=0,discard "$zram_dev" "$OVERCLOCK_WORKSPACE" 2>/dev/null; then
-              warn "mount of $zram_dev on $OVERCLOCK_WORKSPACE failed"
-              if [[ "$ws_had_files" -eq 1 && -n "$preserve_dir" && -d "$preserve_dir" ]]; then
-                cp -a "$preserve_dir/." "$OVERCLOCK_WORKSPACE/" 2>/dev/null || true
-                rm -rf "$preserve_dir" 2>/dev/null || true
-              fi
-              zramctl --reset "$zram_dev" 2>/dev/null || true
-              state ZRAM "failed"
-              state ZRAM_DEV ""
-              state ZRAM_SIZE ""
-              state ZRAM_ALGO ""
-              state ZRAM_DETAIL "mount failed"
-            else
-              rmdir "$OVERCLOCK_WORKSPACE/lost+found" 2>/dev/null || true
-              if [[ "$ws_had_files" -eq 1 && -n "$preserve_dir" && -d "$preserve_dir" ]]; then
-                cp -a "$preserve_dir/." "$OVERCLOCK_WORKSPACE/" 2>/dev/null || true
-                rm -rf "$preserve_dir" 2>/dev/null || true
-                chown -R "$OVERCLOCK_UID:$OVERCLOCK_GID" "$OVERCLOCK_WORKSPACE" 2>/dev/null || true
-              else
-                chown "$OVERCLOCK_UID:$OVERCLOCK_GID" "$OVERCLOCK_WORKSPACE" 2>/dev/null || true
-              fi
-
-              state ZRAM "active"
-              state ZRAM_DEV "$zram_dev"
-              state ZRAM_SIZE "$OVERCLOCK_ZRAM_SIZE"
-              state ZRAM_ALGO "$zram_algo"
-              state ZRAM_DETAIL "mounted"
-              zram_active=1
-            fi
+          zram_dev="$(zramctl --find --size "$size_bytes" 2>>"$SETUP_LOG" || true)"
+          if [[ -n "$zram_dev" ]]; then
+            zram_algo="default"
+            break
           fi
+        fi
+      done
+
+      if [[ -z "$zram_dev" ]]; then
+        warn "zramctl failed to allocate a swap device"
+        record_status ZRAM_SWAP "failed" "allocation failed"
+      else
+        if mkswap "$zram_dev" >>"$SETUP_LOG" 2>&1 && swapon -p 100 "$zram_dev" >>"$SETUP_LOG" 2>&1; then
+          record_status ZRAM_SWAP "active"
+          {
+            printf 'ZRAM_DEV=%s\n' "$zram_dev"
+            printf 'ZRAM_ALGO=%s\n' "$zram_algo"
+            printf 'ZRAM_SIZE=%s\n' "$OVERCLOCK_ZRAM_SWAP_SIZE"
+          } >> "$STATE_FILE"
+
+          # Update swappiness to 100 for zram swap
+          if [[ -w /proc/sys/vm/swappiness ]]; then
+            printf '100' > /proc/sys/vm/swappiness 2>>"$SETUP_LOG" || true
+          fi
+        else
+          warn "mkswap or swapon failed on $zram_dev"
+          swapoff "$zram_dev" 2>>"$SETUP_LOG" || true
+          zramctl --reset "$zram_dev" 2>>"$SETUP_LOG" || true
+          record_status ZRAM_SWAP "failed" "mkswap/swapon failed"
         fi
       fi
     fi
   fi
 
-  # Determine arm mode for spill helper
-  if [[ "$ws_had_files" -eq 0 ]]; then
-    arm_mode="any_entry"
-  elif [[ "$ws_had_git" -eq 0 ]]; then
-    arm_mode="git_or_timeout"
+  # 7. tmpfs-paths
+  if [[ -z "$OVERCLOCK_TMPFS_PATHS" ]]; then
+    record_status TMPFS_PATHS "disabled"
+  elif [[ "$IS_ROOT" != "true" ]]; then
+    record_status TMPFS_PATHS "skipped" "non-root"
   else
-    arm_mode="immediate"
-  fi
+    local mounted_paths=()
+    local size_opt="size=${OVERCLOCK_TMPFS_SIZE:-50%}"
+    local paths_array=()
+    IFS=',' read -r -a paths_array <<< "$OVERCLOCK_TMPFS_PATHS"
 
-  # 7. Spill dirs
-  if [[ "$zram_active" -eq 1 && -n "$OVERCLOCK_SPILL_DIRS" ]]; then
-    local spill_array=()
-    IFS=',' read -r -a spill_array <<< "$OVERCLOCK_SPILL_DIRS"
-    for dir in "${spill_array[@]}"; do
-      [[ -n "$dir" ]] || continue
-      mkdir -p "/mnt/overclock-spill/$dir" 2>/dev/null || true
-      chown -R "$OVERCLOCK_UID:$OVERCLOCK_GID" "/mnt/overclock-spill/$dir" 2>/dev/null || true
-    done
-    chown "$OVERCLOCK_UID:$OVERCLOCK_GID" /mnt/overclock-spill 2>/dev/null || true
+    for target in "${paths_array[@]}"; do
+      [[ -n "$target" ]] || continue
+      local temp_stage=""
+      local has_files=0
 
-    if [[ "$arm_mode" == "immediate" ]]; then
-      warn "workspace is non-empty with existing .git; binding spill dirs immediately (actions/checkout with clean: true may conflict)"
-      state SPILL_DIRS "$OVERCLOCK_SPILL_DIRS"
-      state SPILL_MODE "immediate"
-      state SPILL_HELPER_PID ""
-      for dir in "${spill_array[@]}"; do
-        [[ -n "$dir" ]] || continue
-        bind_spill_dir "$dir"
-      done
-    else
-      state SPILL_DIRS "$OVERCLOCK_SPILL_DIRS"
-      state SPILL_MODE "deferred"
-      export OVERCLOCK_WORKSPACE OVERCLOCK_SPILL_DIRS OVERCLOCK_STATE_FILE OVERCLOCK_UID OVERCLOCK_GID OVERCLOCK_ARM_MODE="$arm_mode"
-      setsid "$0" spill-helper </dev/null >>/tmp/overclock-spill-helper.log 2>&1 &
-      local helper_pid=$!
-      echo "$helper_pid" > /tmp/overclock-spill-helper.pid 2>/dev/null || true
-      state SPILL_HELPER_PID "$helper_pid"
-    fi
-  else
-    state SPILL_DIRS "$OVERCLOCK_SPILL_DIRS"
-    state SPILL_MODE "none"
-    state SPILL_HELPER_PID ""
-  fi
+      if [[ -d "$target" ]]; then
+        local entries=()
+        shopt -s nullglob dotglob
+        entries=("$target"/*)
+        shopt -u nullglob dotglob
+        if [[ ${#entries[@]} -gt 0 ]]; then
+          has_files=1
+          temp_stage="$(mktemp -d /tmp/overclock-tmpfs-stage.XXXXXX 2>>"$SETUP_LOG" || true)"
+          if [[ -n "$temp_stage" && -d "$temp_stage" ]]; then
+            cp -a "$target/." "$temp_stage/" 2>>"$SETUP_LOG" || true
+          fi
+        fi
+      else
+        mkdir -p "$target" 2>>"$SETUP_LOG" || true
+      fi
 
-  # 8. Git tuning
-  if [[ "$OVERCLOCK_GIT_TUNING" != "true" ]]; then
-    state GIT_TUNING "disabled"
-  elif ! command -v git >/dev/null 2>&1; then
-    state GIT_TUNING "failed"
-  else
-    local scope_flag="--global"
-    local scope_name="global"
-    if [[ "$IS_ROOT" == "true" ]]; then
-      scope_flag="--system"
-      scope_name="system"
-    fi
-
-    local git_kvs=(
-      "feature.manyFiles:true"
-      "core.untrackedCache:true"
-      "core.fscache:true"
-      "pack.threads:0"
-      "index.threads:true"
-      "checkout.workers:0"
-      "fetch.parallel:0"
-      "submodule.fetchJobs:0"
-      "gc.auto:0"
-      "maintenance.auto:false"
-      "index.skipHash:false"
-    )
-
-    local git_failed=0
-    for kv in "${git_kvs[@]}"; do
-      local k="${kv%%:*}"
-      local v="${kv#*:}"
-      if ! git config "$scope_flag" "$k" "$v" 2>/dev/null; then
-        git_failed=1
+      if mount -t tmpfs -o "$size_opt" tmpfs "$target" 2>>"$SETUP_LOG"; then
+        if [[ "$has_files" -eq 1 && -n "$temp_stage" && -d "$temp_stage" ]]; then
+          cp -a "$temp_stage/." "$target/" 2>>"$SETUP_LOG" || true
+          rm -rf "$temp_stage" 2>>"$SETUP_LOG" || true
+        fi
+        chown -R "$OVERCLOCK_UID:$OVERCLOCK_GID" "$target" 2>>"$SETUP_LOG" || true
+        mounted_paths+=("$target")
+      else
+        if [[ -n "$temp_stage" && -d "$temp_stage" ]]; then
+          rm -rf "$temp_stage" 2>>"$SETUP_LOG" || true
+        fi
+        warn "Failed to mount tmpfs on $target"
       fi
     done
 
-    if [[ "$git_failed" -eq 0 ]]; then
-      state GIT_TUNING "$scope_name"
+    if [[ ${#mounted_paths[@]} -gt 0 ]]; then
+      local m_str
+      m_str=$(IFS=,; echo "${mounted_paths[*]}")
+      record_status TMPFS_PATHS "active" "$m_str"
+      printf 'TMPFS_MOUNTED=%s\n' "$m_str" >> "$STATE_FILE"
     else
-      warn "git config tuning failed on scope $scope_name"
-      state GIT_TUNING "failed"
+      record_status TMPFS_PATHS "failed" "mount failed"
     fi
   fi
 
-  # 9. Wait for background compile and finalize state
+  # 8. Wait for background compile and finalize state
   if [[ -n "$compile_pid" ]]; then
-    wait "$compile_pid" 2>/dev/null || true
+    wait "$compile_pid" 2>>"$SETUP_LOG" || true
   fi
 
   if [[ "$OVERCLOCK_FSYNC_BYPASS" == "true" ]]; then
@@ -832,6 +650,9 @@ EOF
       local lib_path=""
       local preload_val=""
       local compile_ms="0"
+      local scope=""
+      local installed_lib=""
+      local orig_preload=""
 
       while IFS='=' read -r k v || [[ -n "$k" ]]; do
         case "$k" in
@@ -840,50 +661,58 @@ EOF
           LIB_PATH) lib_path="$v" ;;
           LD_PRELOAD_VALUE) preload_val="$v" ;;
           COMPILE_MS) compile_ms="$v" ;;
+          PRELOAD_SCOPE) scope="$v" ;;
+          INSTALLED_SYSTEM_LIB) installed_lib="$v" ;;
+          ORIG_LD_SO_PRELOAD) orig_preload="$v" ;;
         esac
       done < "$compile_result"
 
       if [[ "$status" == "active" ]]; then
-        state FSYNC_BYPASS "active"
-        state FSYNC_LIB_PATH "$lib_path"
-        state LD_PRELOAD_VALUE "$preload_val"
-        state FSYNC_COMPILE_MS "$compile_ms"
+        record_status FSYNC_BYPASS "active"
+        {
+          printf 'FSYNC_LIB_PATH=%s\n' "$lib_path"
+          printf 'LD_PRELOAD_VALUE=%s\n' "$preload_val"
+          printf 'FSYNC_COMPILE_MS=%s\n' "$compile_ms"
+          printf 'PRELOAD_SCOPE=%s\n' "$scope"
+          if [[ -n "$installed_lib" ]]; then
+            printf 'INSTALLED_SYSTEM_LIB=%s\n' "$installed_lib"
+          fi
+          if [[ -n "$orig_preload" ]]; then
+            printf 'ORIG_LD_SO_PRELOAD=%s\n' "$orig_preload"
+          fi
+        } >> "$STATE_FILE"
       else
         warn "libnosync build failed: ${err:-compilation failed}"
-        state FSYNC_BYPASS "failed"
-        state FSYNC_LIB_PATH ""
-        state LD_PRELOAD_VALUE ""
-        state FSYNC_COMPILE_MS "$compile_ms"
+        record_status FSYNC_BYPASS "failed" "${err:-compilation failed}"
+        printf 'FSYNC_COMPILE_MS=%s\n' "$compile_ms" >> "$STATE_FILE"
       fi
     else
       warn "libnosync build failed: no result produced"
-      state FSYNC_BYPASS "failed"
-      state FSYNC_LIB_PATH ""
-      state LD_PRELOAD_VALUE ""
-      state FSYNC_COMPILE_MS "0"
+      record_status FSYNC_BYPASS "failed" "no result produced"
+      printf 'FSYNC_COMPILE_MS=0\n' >> "$STATE_FILE"
     fi
   else
-    state FSYNC_BYPASS "disabled"
-    state FSYNC_LIB_PATH ""
-    state LD_PRELOAD_VALUE ""
-    state FSYNC_COMPILE_MS "0"
+    record_status FSYNC_BYPASS "disabled"
+    printf 'FSYNC_COMPILE_MS=0\n' >> "$STATE_FILE"
   fi
 
   if [[ -n "$build_tmp" && -d "$build_tmp" ]]; then
-    rm -rf "$build_tmp" 2>/dev/null || true
+    rm -rf "$build_tmp" 2>>"$SETUP_LOG" || true
   fi
 
   local script_end_ms
   script_end_ms="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
   local setup_ms=$(( script_end_ms - script_start_ms ))
-  state SETUP_SCRIPT_MS "$setup_ms"
+  {
+    printf 'SETUP_SCRIPT_MS=%s\n' "$setup_ms"
+    if [[ "$IS_ROOT" == "true" ]]; then
+      printf 'PRIVILEGED=true\n'
+    else
+      printf 'PRIVILEGED=false\n'
+    fi
+  } >> "$STATE_FILE"
 
-  if [[ "$IS_ROOT" == "true" ]]; then
-    state PRIVILEGED "true"
-  else
-    state PRIVILEGED "false"
-  fi
-
+  chown -R "$OVERCLOCK_UID:$OVERCLOCK_GID" "$OVERCLOCK_STATE_DIR" 2>>"$SETUP_LOG" || true
   exit 0
 }
 
@@ -892,9 +721,6 @@ TARGET_MODE="${1:-setup}"
 case "$TARGET_MODE" in
   setup)
     mode_setup
-    ;;
-  spill-helper)
-    mode_spill_helper
     ;;
   teardown)
     mode_teardown

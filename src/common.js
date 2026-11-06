@@ -6,8 +6,7 @@ const child_process = require('child_process');
 
 /**
  * Parse an environment / key-value string.
- * Supports KEY=VALUE pairs. Repeated keys 'SPILL_BOUND' and 'SPILL_SKIPPED'
- * accumulate into arrays. Other keys are last-wins.
+ * Supports KEY=VALUE pairs, comments (#), and stripping quotes.
  *
  * @param {string} content
  * @returns {Record<string, any>}
@@ -39,14 +38,7 @@ function parseEnvFile(content) {
       val = val.slice(1, -1);
     }
 
-    if (key === 'SPILL_BOUND' || key === 'SPILL_SKIPPED') {
-      if (!Array.isArray(result[key])) {
-        result[key] = [];
-      }
-      result[key].push(val);
-    } else {
-      result[key] = val;
-    }
+    result[key] = val;
   }
 
   return result;
@@ -78,81 +70,207 @@ function parseBool(val, defaultValue = false) {
 }
 
 /**
- * Validate and sanitize zram-size.
- * Matches ^[0-9]+(\.[0-9]+)?[KMGT]?$ case-insensitively, returning uppercase;
- * otherwise defaults to '6G'.
+ * Validate and sanitize memory/disk size input (e.g. 50%, 4G, 512M).
  *
  * @param {string} val
+ * @param {string} defaultValue
  * @returns {string}
  */
-function sanitizeZramSize(val) {
+function sanitizeSize(val, defaultValue = '50%') {
   if (typeof val !== 'string') {
-    return '6G';
+    return defaultValue;
   }
   const trimmed = val.trim();
-  if (/^[0-9]+(\.[0-9]+)?[KMGT]?$/i.test(trimmed)) {
+  if (!trimmed) {
+    return defaultValue;
+  }
+  if (/^[0-9]+(\.[0-9]+)?(%|[KMGT]B?)?$/i.test(trimmed)) {
     return trimmed.toUpperCase();
   }
-  return '6G';
+  return defaultValue;
 }
 
 /**
- * Validate and sanitize spill-dirs.
- * Comma-joined sanitized list: trim, strip leading './' and trailing '/',
- * drop empty, drop absolute paths, drop anything containing a '..' segment,
- * drop chars outside [A-Za-z0-9._/@+-].
+ * Validate tmpfs-paths.
+ * Leading '~/' expands to runnerHome.
+ * Must be absolute. Rejects relative paths, paths under GITHUB_WORKSPACE,
+ * and system paths: '/', '/proc', '/sys', '/dev', '/run', '/boot', '/etc', '/usr', '/var/lib/docker', and '$HOME' itself.
  *
- * @param {string} val
+ * @param {string} input - Comma-separated paths
+ * @param {string} [runnerHome]
+ * @param {string} [workspace]
+ * @returns {{ valid: string[], rejected: Array<{ path: string, reason: string }> }}
+ */
+function validateTmpfsPaths(input, runnerHome = '', workspace = '') {
+  const result = {
+    valid: [],
+    rejected: [],
+  };
+
+  if (!input || typeof input !== 'string') {
+    return result;
+  }
+
+  const rawPaths = input.split(',').map(p => p.trim()).filter(Boolean);
+  const homeNorm = runnerHome ? path.posix.normalize(runnerHome.replace(/\\/g, '/')).replace(/\/+$/, '') : '';
+  const wsNorm = workspace ? path.posix.normalize(workspace.replace(/\\/g, '/')).replace(/\/+$/, '') : '';
+
+  const forbiddenSystem = new Set([
+    '/',
+    '/proc',
+    '/sys',
+    '/dev',
+    '/run',
+    '/boot',
+    '/etc',
+    '/usr',
+    '/var/lib/docker',
+  ]);
+
+  const seen = new Set();
+
+  for (const raw of rawPaths) {
+    let resolved = raw.replace(/\\/g, '/');
+
+    // Expand leading ~/ or ~
+    if (resolved === '~') {
+      resolved = homeNorm;
+    } else if (resolved.startsWith('~/')) {
+      resolved = homeNorm ? `${homeNorm}/${resolved.slice(2)}` : resolved.slice(1);
+    }
+
+    // Must be absolute
+    if (!path.posix.isAbsolute(resolved)) {
+      result.rejected.push({ path: raw, reason: 'relative paths are not allowed' });
+      continue;
+    }
+
+    let normalized = path.posix.normalize(resolved);
+    if (normalized.length > 1 && normalized.endsWith('/')) {
+      normalized = normalized.slice(0, -1);
+    }
+
+    // Check $HOME itself
+    if (homeNorm && normalized === homeNorm) {
+      result.rejected.push({ path: raw, reason: '$HOME itself cannot be mounted over with tmpfs' });
+      continue;
+    }
+
+    // Check system directories
+    if (forbiddenSystem.has(normalized)) {
+      result.rejected.push({ path: raw, reason: `system directory '${normalized}' is rejected` });
+      continue;
+    }
+
+    // Check under workspace
+    if (wsNorm && (normalized === wsNorm || normalized.startsWith(wsNorm + '/'))) {
+      result.rejected.push({ path: raw, reason: `path under GITHUB_WORKSPACE ('${wsNorm}') is rejected` });
+      continue;
+    }
+
+    if (!seen.has(normalized)) {
+      seen.add(normalized);
+      result.valid.push(normalized);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Compose LD_PRELOAD: prepend newLib once, deduplicating by basename.
+ *
+ * @param {string|undefined} existingPreload
+ * @param {string} newLib
  * @returns {string}
  */
-function sanitizeSpillDirs(val) {
-  if (typeof val !== 'string' || !val) {
-    return '';
+function composeLdPreload(existingPreload, newLib) {
+  if (!newLib) {
+    return existingPreload || '';
   }
-  const parts = val.split(',');
-  const validChars = /^[A-Za-z0-9._/@+-]+$/;
-  const sanitized = [];
-
-  for (const part of parts) {
-    let s = part.trim();
-    if (!s) {
-      continue;
-    }
-
-    // Drop absolute paths (/..., \..., C:\...)
-    if (s.startsWith('/') || s.startsWith('\\') || /^[a-zA-Z]:[\\/]/.test(s)) {
-      continue;
-    }
-
-    // Strip leading './' or '.\'
-    while (s.startsWith('./') || s.startsWith('.\\')) {
-      s = s.slice(2);
-    }
-
-    // Strip trailing '/' or '\'
-    while (s.endsWith('/') || s.endsWith('\\')) {
-      s = s.slice(0, -1);
-    }
-
-    if (!s) {
-      continue;
-    }
-
-    // Drop anything containing a '..' segment
-    const segments = s.split(/[\\/]/);
-    if (segments.some(seg => seg === '..' || seg.includes('..'))) {
-      continue;
-    }
-
-    // Drop strings with characters outside [A-Za-z0-9._/@+-]
-    if (!validChars.test(s)) {
-      continue;
-    }
-
-    sanitized.push(s);
+  const cleanNew = newLib.trim();
+  if (!cleanNew) {
+    return existingPreload || '';
+  }
+  if (!existingPreload || !existingPreload.trim()) {
+    return cleanNew;
   }
 
-  return sanitized.join(',');
+  const newBase = path.posix.basename(cleanNew.replace(/\\/g, '/'));
+  const parts = existingPreload.split(':').map(p => p.trim()).filter(Boolean);
+  const filtered = parts.filter(p => {
+    const b = path.posix.basename(p.replace(/\\/g, '/'));
+    return b !== newBase;
+  });
+
+  return [cleanNew, ...filtered].join(':');
+}
+
+/**
+ * Compose ASAN_OPTIONS: append 'verify_asan_link_order=0' colon-separated if not present.
+ *
+ * @param {string|undefined} existingAsan
+ * @returns {string}
+ */
+function composeAsanOptions(existingAsan) {
+  const target = 'verify_asan_link_order=0';
+  if (!existingAsan || !existingAsan.trim()) {
+    return target;
+  }
+  const parts = existingAsan.split(':').map(p => p.trim()).filter(Boolean);
+  if (parts.includes(target)) {
+    return existingAsan;
+  }
+  return `${existingAsan}:${target}`;
+}
+
+/**
+ * Compose git config environment variables (GIT_CONFIG_*).
+ *
+ * @param {Record<string, string|undefined>} env
+ * @param {Array<[string, string]>} configs
+ * @returns {Record<string, string>}
+ */
+function composeGitConfigEnv(env, configs) {
+  const rawCount = env && env.GIT_CONFIG_COUNT;
+  let count = parseInt(rawCount, 10);
+  if (isNaN(count) || count < 0) {
+    count = 0;
+  }
+
+  const result = {};
+  for (let i = 0; i < configs.length; i++) {
+    const idx = count + i;
+    result[`GIT_CONFIG_KEY_${idx}`] = configs[i][0];
+    result[`GIT_CONFIG_VALUE_${idx}`] = configs[i][1];
+  }
+  result.GIT_CONFIG_COUNT = String(count + configs.length);
+  return result;
+}
+
+/**
+ * Check if git version is >= 2.31.0.
+ *
+ * @param {string} versionOutput
+ * @returns {boolean}
+ */
+function checkGitVersion(versionOutput) {
+  if (!versionOutput || typeof versionOutput !== 'string') {
+    return false;
+  }
+  const match = versionOutput.match(/git version\s+(\d+)\.(\d+)(?:\.(\d+))?/i);
+  if (!match) {
+    return false;
+  }
+  const major = parseInt(match[1], 10);
+  const minor = parseInt(match[2], 10);
+  if (major > 2) {
+    return true;
+  }
+  if (major === 2 && minor >= 31) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -283,40 +401,16 @@ function appendGithubSummary(content) {
 }
 
 /**
- * Get input value from environment with fallback.
- * Checks INPUT_<NAME> and INPUT_<NAME_UNDERSCORED>.
- *
- * @param {string} name
- * @param {string} defaultValue
- * @returns {string}
- */
-function getInput(name, defaultValue) {
-  const upper = name.toUpperCase();
-  const rawHyphen = process.env['INPUT_' + upper];
-  if (rawHyphen !== undefined && rawHyphen !== null && rawHyphen.trim() !== '') {
-    return rawHyphen.trim();
-  }
-  const rawUnderscore = process.env['INPUT_' + upper.replace(/-/g, '_')];
-  if (rawUnderscore !== undefined && rawUnderscore !== null && rawUnderscore.trim() !== '') {
-    return rawUnderscore.trim();
-  }
-  return defaultValue;
-}
-
-/**
  * Run root script with bash / sudo / unprivileged strategy.
- *
- * Strategy:
- * 1. if process.getuid() === 0 -> bash <script> <args> with env merged
- * 2. else if sudo exists and `sudo -n true` exits 0 -> sudo -n env K1=V1 ... bash <script> <args>
- * 3. else -> bash <script> <args> unprivileged
+ * Timeout: 60s.
  *
  * @param {string} scriptPath
  * @param {string[]} args
  * @param {Record<string, string>} envVars
+ * @param {object} [options]
  * @returns {child_process.SpawnSyncReturns<string>}
  */
-function runRootScript(scriptPath, args = [], envVars = {}) {
+function runRootScript(scriptPath, args = [], envVars = {}, options = {}) {
   const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
   let canSudo = false;
 
@@ -334,7 +428,7 @@ function runRootScript(scriptPath, args = [], envVars = {}) {
 
   let command;
   let cmdArgs;
-  let spawnEnv = { ...process.env, ...envVars };
+  const spawnEnv = { ...process.env, ...envVars };
 
   if (isRoot) {
     command = 'bash';
@@ -353,7 +447,7 @@ function runRootScript(scriptPath, args = [], envVars = {}) {
     res = child_process.spawnSync(command, cmdArgs, {
       cwd: '/',
       stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 120000,
+      timeout: options.timeout || 60000,
       maxBuffer: 16 * 1024 * 1024,
       env: spawnEnv,
       encoding: 'utf8',
@@ -380,8 +474,12 @@ function runRootScript(scriptPath, args = [], envVars = {}) {
 module.exports = {
   parseEnvFile,
   parseBool,
-  sanitizeZramSize,
-  sanitizeSpillDirs,
+  sanitizeSize,
+  validateTmpfsPaths,
+  composeLdPreload,
+  composeAsanOptions,
+  composeGitConfigEnv,
+  checkGitVersion,
   escapeMarkdown,
   formatBytes,
   formatNumber,
@@ -391,6 +489,5 @@ module.exports = {
   appendGithubOutput,
   appendGithubState,
   appendGithubSummary,
-  getInput,
   runRootScript,
 };

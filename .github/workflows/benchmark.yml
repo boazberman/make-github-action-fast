@@ -1,9 +1,15 @@
-name: Benchmark & E2E
+name: Benchmark & CI
 
 on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      reps:
+        description: 'Number of repetitions per config'
+        required: false
+        default: '5'
+        type: string
 
 permissions:
   contents: read
@@ -13,418 +19,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  bench:
-    name: ${{ matrix.mode }} / ${{ matrix.runner }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-22.04, ubuntu-24.04, ubuntu-24.04-arm]
-        mode: [baseline, accelerated, accelerated-zram]
-        exclude:
-          - runner: ubuntu-22.04
-            mode: accelerated-zram
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Accelerate runner (standard)
-        uses: ./
-        if: matrix.mode == 'accelerated'
-
-      - name: Accelerate runner (zram)
-        uses: ./
-        if: matrix.mode == 'accelerated-zram'
-        with:
-          zram-workspace: 'true'
-          zram-size: '4G'
-          spill-dirs: 'node_modules,target'
-
-      - name: Verify acceleration
-        if: matrix.mode != 'baseline'
-        run: |
-          echo "=== Verifying acceleration for mode: ${{ matrix.mode }} ==="
-
-          # Assert LD_PRELOAD contains libnosync.so
-          echo "LD_PRELOAD: $LD_PRELOAD"
-          if [[ "$LD_PRELOAD" != *"libnosync.so"* ]]; then
-            echo "::error::LD_PRELOAD does not contain libnosync.so"
-            exit 1
-          fi
-
-          # Prove preload works via /proc/self/maps
-          if ! grep -q libnosync /proc/self/maps; then
-            echo "::error::libnosync not found in /proc/self/maps"
-            exit 1
-          fi
-          echo "Verified: libnosync loaded in process memory"
-
-          # Assert /proc/sys/vm/dirty_ratio == 80
-          dirty_ratio=$(cat /proc/sys/vm/dirty_ratio)
-          if [ "$dirty_ratio" != "80" ]; then
-            echo "::error::dirty_ratio is $dirty_ratio, expected 80"
-            exit 1
-          fi
-          echo "Verified: /proc/sys/vm/dirty_ratio == 80"
-
-          # Check root mount options (warn only, don't fail)
-          root_opts=$(findmnt -no OPTIONS / || true)
-          echo "Root mount options: $root_opts"
-          if [[ "$root_opts" == *"nobarrier"* ]] || [[ "$root_opts" == *"barrier=0"* ]]; then
-            echo "Verified: root mount has nobarrier or barrier=0"
-          else
-            echo "::warning title=overclock::Root mount does not show nobarrier or barrier=0 (options: $root_opts)"
-          fi
-
-          # Check git config --system feature.manyFiles == true
-          git_many_files=$(git config --system feature.manyFiles || true)
-          if [ "$git_many_files" != "true" ]; then
-            echo "::error::git config --system feature.manyFiles is '$git_many_files', expected 'true'"
-            exit 1
-          fi
-          echo "Verified: git config --system feature.manyFiles == true"
-
-          # Check zram specifics
-          if [ "${{ matrix.mode }}" = "accelerated-zram" ]; then
-            ws_source=$(findmnt -no SOURCE "$GITHUB_WORKSPACE" || true)
-            echo "Workspace source: $ws_source"
-            if [[ "$ws_source" != *"/dev/zram"* ]]; then
-              echo "::error::Workspace source does not match /dev/zram (source: $ws_source)"
-              exit 1
-            fi
-            echo "Verified: workspace source matches /dev/zram"
-
-            # Workspace was non-empty with .git at action time, so spill binds are immediate
-            if ! mountpoint -q "$GITHUB_WORKSPACE/node_modules"; then
-              echo "::error::$GITHUB_WORKSPACE/node_modules is not a mountpoint"
-              exit 1
-            fi
-            echo "Verified: $GITHUB_WORKSPACE/node_modules is a bind mountpoint"
-          fi
-          echo "=== Acceleration verification completed successfully ==="
-
-      - name: Benchmark 1 - SQLite fsync transactions
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/bench-tmp"
-          python3 - <<'PY'
-          import sqlite3
-          import time
-          import os
-
-          ws = os.environ.get("GITHUB_WORKSPACE", ".")
-          bench_dir = os.path.join(ws, "bench-tmp")
-          os.makedirs(bench_dir, exist_ok=True)
-          db_path = os.path.join(bench_dir, "bench_sqlite.db")
-          if os.path.exists(db_path):
-              os.remove(db_path)
-
-          conn = sqlite3.connect(db_path)
-          conn.execute("PRAGMA journal_mode=DELETE;")
-          conn.execute("PRAGMA synchronous=FULL;")
-          conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, val TEXT);")
-          conn.commit()
-
-          num_inserts = 5000
-          t0 = time.perf_counter()
-          for i in range(num_inserts):
-              conn.execute("INSERT INTO bench (val) VALUES (?);", (f"record-{i}",))
-              conn.commit()
-          elapsed_s = time.perf_counter() - t0
-          conn.close()
-
-          elapsed_ms = round(elapsed_s * 1000.0, 2)
-          rows_per_sec = round(num_inserts / elapsed_s, 2) if elapsed_s > 0 else 0
-          print(f"Benchmark 1: {num_inserts} SQLite transactions in {elapsed_ms} ms ({rows_per_sec} rows/sec)")
-
-          tmp_dir = os.environ.get("RUNNER_TEMP", "/tmp")
-          results_file = os.path.join(tmp_dir, "bench_step_results.env")
-          with open(results_file, "a") as f:
-              f.write(f"SQLITE_MS={elapsed_ms}\n")
-          PY
-
-      - name: Benchmark 2 - Small files extract, git add/commit, rm
-        run: |
-          echo "Generating 30,000 small files tarball under $RUNNER_TEMP..."
-          python3 - <<'PY'
-          import tarfile
-          import io
-          import os
-
-          tmp_dir = os.environ.get("RUNNER_TEMP", "/tmp")
-          tar_path = os.path.join(tmp_dir, "bench_30k_files.tar")
-          if os.path.exists(tar_path):
-              os.remove(tar_path)
-
-          payloads = [os.urandom(sz) for sz in range(200, 2001, 100)]
-          num_payloads = len(payloads)
-
-          with tarfile.open(tar_path, "w") as tar:
-              for i in range(30000):
-                  dir_idx = i % 300
-                  data = payloads[i % num_payloads]
-                  ti = tarfile.TarInfo(name=f"dir_{dir_idx:03d}/file_{i:05d}.dat")
-                  ti.size = len(data)
-                  ti.mtime = 1700000000
-                  ti.mode = 0o644
-                  tar.addfile(ti, io.BytesIO(data))
-          print(f"Generated tarball: {tar_path} ({os.path.getsize(tar_path)} bytes)")
-          PY
-
-          # Time phase 1: tar -xf
-          tree_dir="$GITHUB_WORKSPACE/bench-tmp/tree"
-          rm -rf "$tree_dir"
-          mkdir -p "$tree_dir"
-
-          echo "Timing tar extraction..."
-          t_start=$(date +%s%N)
-          tar -xf "$RUNNER_TEMP/bench_30k_files.tar" -C "$tree_dir"
-          t_end=$(date +%s%N)
-          extract_ms=$(( (t_end - t_start) / 1000000 ))
-          echo "Phase 1 - Tar extract 30k files: ${extract_ms} ms"
-
-          # Time phase 2: git init, add, commit
-          echo "Timing git init + add + commit..."
-          t_start=$(date +%s%N)
-          (
-            cd "$tree_dir"
-            git init -q
-            git add -A
-            git -c user.name=bench -c user.email=bench@example.com commit -q -m bench
-          )
-          t_end=$(date +%s%N)
-          git_ms=$(( (t_end - t_start) / 1000000 ))
-          echo "Phase 2 - Git init + add + commit: ${git_ms} ms"
-
-          # Time phase 3: rm -rf
-          echo "Timing rm -rf..."
-          t_start=$(date +%s%N)
-          rm -rf "$tree_dir"
-          t_end=$(date +%s%N)
-          rm_ms=$(( (t_end - t_start) / 1000000 ))
-          echo "Phase 3 - Rm -rf 30k files: ${rm_ms} ms"
-
-          rm -f "$RUNNER_TEMP/bench_30k_files.tar"
-
-          cat <<EOF >> "$RUNNER_TEMP/bench_step_results.env"
-          EXTRACT_MS=$extract_ms
-          GIT_MS=$git_ms
-          RM_MS=$rm_ms
-          EOF
-
-      - name: Benchmark 3 - npm ci (offline disk)
-        run: |
-          npm_dir="$GITHUB_WORKSPACE/bench-tmp/npm"
-          rm -rf "$npm_dir"
-          mkdir -p "$npm_dir"
-          cd "$npm_dir"
-
-          cat <<'EOF' > package.json
-          {
-            "name": "bench-npm",
-            "version": "1.0.0",
-            "private": true,
-            "dependencies": {
-              "express": "^4.19.2",
-              "lodash": "^4.17.21"
-            },
-            "devDependencies": {
-              "eslint": "^8.57.0",
-              "jest": "^29.7.0",
-              "typescript": "^5.4.5",
-              "webpack": "^5.91.0"
-            }
-          }
-          EOF
-
-          echo "Running untimed package-lock generation..."
-          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
-
-          echo "Running untimed warm-up npm ci (populating cache)..."
-          npm ci --ignore-scripts --no-audit --no-fund
-
-          echo "Removing node_modules before timed offline run..."
-          rm -rf node_modules
-
-          echo "Timing npm ci --prefer-offline..."
-          t_start=$(date +%s%N)
-          npm ci --ignore-scripts --no-audit --no-fund --prefer-offline
-          t_end=$(date +%s%N)
-          npm_ci_ms=$(( (t_end - t_start) / 1000000 ))
-          echo "Benchmark 3 - npm ci offline disk time: ${npm_ci_ms} ms"
-
-          echo "NPM_CI_MS=$npm_ci_ms" >> "$RUNNER_TEMP/bench_step_results.env"
-
-      - name: Record benchmark results
-        env:
-          BENCH_RUNNER: ${{ matrix.runner }}
-          BENCH_MODE: ${{ matrix.mode }}
-        run: |
-          if [ -f "$RUNNER_TEMP/bench_step_results.env" ]; then
-            source "$RUNNER_TEMP/bench_step_results.env"
-          fi
-
-          export SQLITE_MS="${SQLITE_MS:-0}"
-          export EXTRACT_MS="${EXTRACT_MS:-0}"
-          export GIT_MS="${GIT_MS:-0}"
-          export RM_MS="${RM_MS:-0}"
-          export NPM_CI_MS="${NPM_CI_MS:-0}"
-
-          python3 - <<'PY'
-          import json
-          import os
-
-          runner = os.environ.get("BENCH_RUNNER", "unknown")
-          mode = os.environ.get("BENCH_MODE", "unknown")
-          arch = os.uname().machine
-
-          sqlite_ms = float(os.environ.get("SQLITE_MS", 0))
-          extract_ms = float(os.environ.get("EXTRACT_MS", 0))
-          git_ms = float(os.environ.get("GIT_MS", 0))
-          rm_ms = float(os.environ.get("RM_MS", 0))
-          npm_ci_ms = float(os.environ.get("NPM_CI_MS", 0))
-
-          print("=" * 60)
-          print(f"BENCHMARK RESULTS: {runner} ({mode}) [{arch}]")
-          print(f"  SQLite (5000 fsync txs): {sqlite_ms:,.1f} ms")
-          print(f"  Extract (30k files):     {extract_ms:,.1f} ms")
-          print(f"  Git add + commit:        {git_ms:,.1f} ms")
-          print(f"  Rm -rf (30k files):      {rm_ms:,.1f} ms")
-          print(f"  npm ci (offline disk):   {npm_ci_ms:,.1f} ms")
-          print("=" * 60)
-
-          result = {
-              "runner": runner,
-              "mode": mode,
-              "arch": arch,
-              "sqlite_ms": sqlite_ms,
-              "extract_ms": extract_ms,
-              "git_ms": git_ms,
-              "rm_ms": rm_ms,
-              "npm_ci_ms": npm_ci_ms
-          }
-
-          filename = f"results-{mode}-{runner}.json"
-          with open(filename, "w", encoding="utf-8") as f:
-              json.dump(result, f, indent=2)
-          print(f"Wrote benchmark results to {filename}")
-          PY
-
-      - name: Upload benchmark artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: bench-${{ matrix.mode }}-${{ matrix.runner }}
-          path: results-${{ matrix.mode }}-${{ matrix.runner }}.json
-          retention-days: 7
-
-  compare:
-    name: Compare Benchmark Results
-    needs: bench
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all benchmark artifacts
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          pattern: bench-*
-          merge-multiple: true
-
-      - name: Generate comparison report
-        run: |
-          python3 - <<'PY'
-          import glob
-          import json
-          import os
-          import sys
-
-          files = glob.glob("results-*.json")
-          if not files:
-              msg = "No benchmark results found (runs may have failed or been skipped)."
-              print(msg)
-              summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-              if summary_path:
-                  with open(summary_path, "a", encoding="utf-8") as f:
-                      f.write(f"## ⚡ Benchmark Comparison\n\n{msg}\n")
-              sys.exit(0)
-
-          records = []
-          for f in sorted(files):
-              try:
-                  with open(f, "r", encoding="utf-8") as fp:
-                      records.append(json.load(fp))
-              except Exception as exc:
-                  print(f"Warning: could not parse {f}: {exc}")
-
-          by_runner = {}
-          for r in records:
-              runner = r.get("runner", "unknown")
-              mode = r.get("mode", "unknown")
-              by_runner.setdefault(runner, {})[mode] = r
-
-          metrics = [
-              ("sqlite_ms", "SQLite 5,000 fsync txs"),
-              ("extract_ms", "Extract 30k small files"),
-              ("git_ms", "Git add + commit (30k files)"),
-              ("rm_ms", "Delete tree (rm -rf 30k files)"),
-              ("npm_ci_ms", "npm ci (offline disk)"),
-          ]
-
-          report_lines = []
-          report_lines.append("## ⚡ Benchmark Comparison Results")
-          report_lines.append("")
-
-          for runner in sorted(by_runner.keys()):
-              modes = by_runner[runner]
-              arch = next((v.get("arch", "") for v in modes.values() if v.get("arch")), "")
-              title = f"### Runner: `{runner}`" + (f" ({arch})" if arch else "")
-              report_lines.append(title)
-              report_lines.append("")
-              report_lines.append("| Metric | Baseline | Accelerated | Speedup | Accelerated (zram) | Speedup |")
-              report_lines.append("|:---|---:|---:|---:|---:|---:|")
-
-              base = modes.get("baseline", {})
-              acc = modes.get("accelerated", {})
-              zram = modes.get("accelerated-zram", {})
-
-              for key, label in metrics:
-                  b_val = base.get(key)
-                  a_val = acc.get(key)
-                  z_val = zram.get(key)
-
-                  b_str = f"{b_val:,.1f} ms" if (b_val is not None and b_val > 0) else "n/a"
-                  a_str = f"{a_val:,.1f} ms" if (a_val is not None and a_val > 0) else "n/a"
-                  z_str = f"{z_val:,.1f} ms" if (z_val is not None and z_val > 0) else "n/a"
-
-                  if b_val and a_val and a_val > 0:
-                      speedup_a = f"**{b_val / a_val:.1f}x**"
-                  else:
-                      speedup_a = "-"
-
-                  if b_val and z_val and z_val > 0:
-                      speedup_z = f"**{b_val / z_val:.1f}x**"
-                  else:
-                      speedup_z = "-"
-
-                  report_lines.append(f"| {label} | {b_str} | {a_str} | {speedup_a} | {z_str} | {speedup_z} |")
-
-              report_lines.append("")
-
-          full_report = "\n".join(report_lines)
-          print(full_report)
-
-          summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
-          if summary_file:
-              try:
-                  with open(summary_file, "a", encoding="utf-8") as f:
-                      f.write(full_report + "\n")
-              except Exception as exc:
-                  print(f"Warning: could not write to GITHUB_STEP_SUMMARY: {exc}")
-          PY
-
-  e2e-real-checkout:
-    name: e2e-real-checkout / ${{ matrix.runner }}
+  test:
+    name: test / ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -432,94 +28,114 @@ jobs:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
 
     steps:
-      - name: (1) Checkout action source to temporary path
-        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install test dependencies
+        run: |
+          if ! command -v strace >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq strace
+          fi
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          fi
+          sudo sysctl -w kernel.yama.ptrace_scope=0 2>/dev/null || true
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Lint JavaScript
+        run: npm run lint
+
+      - name: Shellcheck bash scripts
+        run: shellcheck src/*.sh bench/*.sh bench/workloads/*.sh test/*.sh
+
+      - name: Run nosync integration tests
+        run: bash test/nosync_test.sh
+
+  e2e:
+    name: e2e / ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Accelerate runner (overclock v2)
+        uses: ./
         with:
-          path: _src
+          zram-swap: 'true'
+          tmpfs-paths: '~/.cache/overclock-e2e'
 
-      - name: (2) Relocate action to RUNNER_TEMP and clean workspace
+      - name: Verify acceleration and telemetry
         run: |
-          cp -a "$GITHUB_WORKSPACE/_src" "$RUNNER_TEMP/overclock"
-          rm -rf "$GITHUB_WORKSPACE/_src"
-          remaining=$(ls -A "$GITHUB_WORKSPACE")
-          if [ -n "$remaining" ]; then
-            echo "::error::Workspace is not empty after cleanup: $remaining"
-            exit 1
-          fi
-          echo "Workspace successfully emptied for real-checkout test"
-
-      - name: (3) Run action main.js directly before checkout
-        run: |
-          env 'INPUT_ZRAM-WORKSPACE=true' 'INPUT_ZRAM-SIZE=4G' 'INPUT_SPILL-DIRS=node_modules,target' node "$RUNNER_TEMP/overclock/src/main.js"
-
-      - name: (4) Checkout repository into zram workspace
-        uses: actions/checkout@v4
-
-      - name: (5) Verify zram workspace and deferred spill binds
-        run: |
-          echo "=== Verifying zram workspace mount ==="
-          ws_src=$(findmnt -no SOURCE "$GITHUB_WORKSPACE" || true)
-          echo "Workspace source: $ws_src"
-          if [[ "$ws_src" != *"/dev/zram"* ]]; then
-            echo "::error::Workspace is not mounted on zram (source: $ws_src)"
+          echo "=== Checking LD_PRELOAD in process maps ==="
+          if ! grep -q libnosync /proc/self/maps; then
+            echo "::error::libnosync not found in /proc/self/maps"
             exit 1
           fi
 
-          echo "=== Verifying .git existence ==="
-          if [ ! -d "$GITHUB_WORKSPACE/.git" ]; then
-            echo "::error::.git directory does not exist in workspace"
+          echo "=== Checking dirty_ratio ==="
+          dirty_ratio=$(cat /proc/sys/vm/dirty_ratio)
+          if [ "$dirty_ratio" != "45" ]; then
+            echo "::error::dirty_ratio is $dirty_ratio, expected 45"
             exit 1
           fi
 
-          echo "=== Polling for deferred spill binds (up to 10s) ==="
-          bound=false
-          cd "$GITHUB_WORKSPACE"
-          for i in $(seq 1 100); do
-            if mountpoint -q node_modules && mountpoint -q target; then
-              echo "Spill binds active after $(( i * 100 )) ms"
-              bound=true
-              break
-            fi
-            sleep 0.1
-          done
-          if [ "$bound" != "true" ]; then
-            echo "::error::Spill directories failed to bind within 10s"
-            mountpoint node_modules || true
-            mountpoint target || true
+          echo "=== Checking zram swap in /proc/swaps ==="
+          if ! grep -q zram /proc/swaps; then
+            echo "::error::zram device not found in /proc/swaps"
             exit 1
           fi
 
-          echo "=== Testing spill filesystem write/delete ==="
-          touch node_modules/x
-          rm node_modules/x
-          echo "node_modules write/delete verified"
-
-          echo "=== Testing git status ==="
-          git status --porcelain
-
-          echo "=== Checking LD_PRELOAD ==="
-          echo "LD_PRELOAD: $LD_PRELOAD"
-          if [[ "$LD_PRELOAD" != *"libnosync.so"* ]]; then
-            echo "::error::LD_PRELOAD is not active"
+          echo "=== Checking tmpfs mount ==="
+          target_dir="$HOME/.cache/overclock-e2e"
+          if ! mountpoint -q "$target_dir"; then
+            echo "::error::$target_dir is not a mountpoint"
             exit 1
           fi
-          echo "=== E2E verification passed ==="
 
-      - name: (6) Test npm install in spill directory
-        run: |
-          cd "$GITHUB_WORKSPACE"
-          npm init -y >/dev/null
-          npm install --no-audit --no-fund left-pad
-          findmnt -T node_modules
-
-      - name: (7) Teardown and dump helper log
-        if: always()
-        run: |
-          node "$RUNNER_TEMP/overclock/src/post.js" || true
-          if [ -f /tmp/overclock-spill-helper.log ]; then
-            echo "=== /tmp/overclock-spill-helper.log ==="
-            cat /tmp/overclock-spill-helper.log
+          echo "=== Checking GIT_CONFIG_COUNT ==="
+          if [ -z "${GIT_CONFIG_COUNT:-}" ] || [ "$GIT_CONFIG_COUNT" -le 0 ]; then
+            echo "::error::GIT_CONFIG_COUNT is not set or <= 0 ($GIT_CONFIG_COUNT)"
+            exit 1
           fi
+
+          echo "=== Checking dpkg unsafe-io configuration ==="
+          if [ ! -f /etc/dpkg/dpkg.cfg.d/overclock-unsafe-io ]; then
+            echo "::error::/etc/dpkg/dpkg.cfg.d/overclock-unsafe-io not found"
+            exit 1
+          fi
+
+          echo "=== Checking ASAN_OPTIONS ==="
+          if [[ "${ASAN_OPTIONS:-}" != *"verify_asan_link_order=0"* ]]; then
+            echo "::error::ASAN_OPTIONS does not contain verify_asan_link_order=0 ($ASAN_OPTIONS)"
+            exit 1
+          fi
+
+          echo "=== Running SQLite workload to exercise fsync bypass ==="
+          python3 - <<'PY'
+          import os
+          import sqlite3
+
+          db_path = os.path.expanduser("~/.cache/overclock-e2e/e2e.db")
+          conn = sqlite3.connect(db_path)
+          conn.execute("PRAGMA journal_mode=DELETE;")
+          conn.execute("PRAGMA synchronous=FULL;")
+          conn.execute("CREATE TABLE bench_e2e (id INTEGER PRIMARY KEY, val TEXT);")
+          conn.commit()
+
+          for i in range(100):
+              conn.execute("INSERT INTO bench_e2e (val) VALUES (?);", (f"record-{i}",))
+              conn.commit()
+
+          conn.close()
+          print("SQLite e2e workload finished successfully")
+          PY
 
   cross-platform:
     name: cross-platform / ${{ matrix.os }}
@@ -531,7 +147,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Run action (graceful no-op)
         uses: ./
@@ -539,3 +155,61 @@ jobs:
       - name: Verify no-op
         shell: bash
         run: echo ok
+
+  bench:
+    name: bench / ${{ matrix.workload }} / ${{ matrix.runner }}
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        workload: [sqlite, smallfiles, npm-ci, pip-install, apt-reinstall, cargo-build]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Run benchmark
+        env:
+          BENCH_RUNNER: ${{ matrix.runner }}
+        run: |
+          mkdir -p results
+          reps="${{ inputs.reps || 5 }}"
+          bash bench/run.sh "${{ matrix.workload }}" "$reps" "results/bench-${{ matrix.workload }}-${{ matrix.runner }}.json"
+
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.workload }}-${{ matrix.runner }}
+          path: results/*.json
+          retention-days: 7
+
+  report:
+    name: Generate Benchmark Report
+    needs: bench
+    if: always() && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Download all benchmark artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*
+          merge-multiple: true
+          path: results
+
+      - name: Generate report
+        run: |
+          python3 bench/report.py results/*.json
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-report
+          path: bench-report.md
+          retention-days: 7

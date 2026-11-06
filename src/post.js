@@ -16,6 +16,44 @@ const {
 } = require('./common');
 
 /**
+ * Parse NOSYNC_STATS_FILE content.
+ * Tolerates garbage and malformed lines.
+ *
+ * @param {string} content
+ * @returns {{ skippedSync: number, strippedOsync: number, processes: number }}
+ */
+function parseNosyncStats(content) {
+  const result = {
+    skippedSync: 0,
+    strippedOsync: 0,
+    processes: 0,
+  };
+  if (!content || typeof content !== 'string') {
+    return result;
+  }
+
+  const lines = content.split(/\r?\n/);
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) {
+      continue;
+    }
+    const parts = line.split(/\s+/);
+    if (parts.length >= 3) {
+      const skipped = parseInt(parts[1], 10);
+      const stripped = parseInt(parts[2], 10);
+      if (!isNaN(skipped) && !isNaN(stripped) && (skipped > 0 || stripped > 0)) {
+        result.skippedSync += Math.max(0, skipped);
+        result.strippedOsync += Math.max(0, stripped);
+        result.processes += 1;
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
  * Parse CPU stats from /proc/stat content.
  * Returns array of [user, nice, system, idle, iowait, irq, softirq, steal]
  * and sum total (first 8 fields, excluding guest).
@@ -287,7 +325,7 @@ function parseMmStat(content) {
 function statusEmoji(status) {
   if (!status) return '➖ disabled';
   const s = String(status).toLowerCase();
-  if (s === 'active' || s === 'system' || s === 'global') return '✅ active';
+  if (s === 'active' || s === 'system' || s === 'global' || s === 'env') return '✅ ' + status;
   if (s === 'partial') return '⚠️ partial';
   if (s === 'failed' || s === 'unsupported') return '❌ ' + status;
   if (s === 'disabled') return '➖ disabled';
@@ -296,22 +334,20 @@ function statusEmoji(status) {
 }
 
 /**
- * Retrieve zram information via zramctl or mm_stat.
+ * Retrieve zram swap information via zramctl or mm_stat.
  *
  * @param {string} devName
  * @param {Record<string, any>} state
- * @param {string} workspace
  * @returns {Record<string, any>}
  */
-function getZramInfo(devName, state, workspace) {
+function getZramInfo(devName, state = {}) {
   const targetDev = devName || state.ZRAM_DEV || '/dev/zram0';
   let algorithm = state.ZRAM_ALGO || 'lz4';
-  let diskSize = state.ZRAM_SIZE || '6G';
+  let diskSize = state.ZRAM_SIZE || '50%';
   let dataBytes = 0;
   let comprBytes = 0;
   let totalBytes = 0;
   let ratio = 'n/a';
-  let wsUsage = 'n/a';
 
   let resolved = false;
   try {
@@ -346,17 +382,6 @@ function getZramInfo(devName, state, workspace) {
     }
   }
 
-  if (workspace && typeof fs.statfsSync === 'function') {
-    try {
-      const stats = fs.statfsSync(workspace);
-      const total = stats.blocks * stats.bsize;
-      const free = stats.bfree * stats.bsize;
-      const used = Math.max(0, total - free);
-      const pct = total > 0 ? ((used / total) * 100).toFixed(1) : '0.0';
-      wsUsage = `${formatBytes(used)} / ${formatBytes(total)} (${pct}%)`;
-    } catch {}
-  }
-
   return {
     dev: targetDev,
     algorithm,
@@ -365,7 +390,240 @@ function getZramInfo(devName, state, workspace) {
     compr: formatBytes(comprBytes),
     total: formatBytes(totalBytes),
     ratio: ratio !== 'n/a' ? `${ratio}:1` : 'n/a',
-    wsUsage,
+  };
+}
+
+/**
+ * Pure telemetry computation helper.
+ *
+ * @param {object} params
+ * @returns {object}
+ */
+function computeTelemetryData({
+  baseline = {},
+  state = {},
+  nosyncStats = { skippedSync: 0, strippedOsync: 0, processes: 0 },
+  currentCpuStat,
+  currentMeminfoStr,
+  currentVmstatStr,
+  currentDiskstatsStr,
+  currentUptimeStr,
+  zramInfoOverride,
+  nowMs = Date.now(),
+}) {
+  // 1. Elapsed time
+  let elapsedMs = 0;
+  if (baseline.START_EPOCH_MS) {
+    elapsedMs = Math.max(0, nowMs - parseInt(baseline.START_EPOCH_MS, 10));
+  } else if (baseline.START_UPTIME && currentUptimeStr) {
+    const curUp = parseFloat(currentUptimeStr.trim().split(/\s+/)[0]) || 0;
+    const baseUp = parseFloat(baseline.START_UPTIME) || 0;
+    elapsedMs = Math.max(0, Math.round((curUp - baseUp) * 1000));
+  }
+  const elapsedSec = (elapsedMs / 1000).toFixed(2) + 's';
+
+  // 2. CPU delta
+  const cpuDelta = computeCpuDelta(baseline.CPU_STAT || '', currentCpuStat || '');
+
+  // 3. Memory info
+  const mem = parseMeminfo(currentMeminfoStr || '');
+  const memAvailFormatted = `${formatBytes(mem.memAvailable)} / ${formatBytes(mem.memTotal)}`;
+  const dirtyFormatted = formatBytes(mem.dirty);
+  const writebackFormatted = formatBytes(mem.writeback);
+  const cachedFormatted = formatBytes(mem.cached);
+  const swapUsedFormatted = formatBytes(mem.swapUsed);
+
+  // 4. Vmstat deltas
+  const vm = parseVmstat(currentVmstatStr || '');
+  const deltaNrDirtied = Math.max(0, (vm.nr_dirtied || 0) - (parseInt(baseline.VMSTAT_nr_dirtied, 10) || 0));
+  const dataWrittenPageCache = formatBytes(deltaNrDirtied * 4096);
+  const deltaPswpout = Math.max(0, (vm.pswpout || 0) - (parseInt(baseline.VMSTAT_pswpout, 10) || 0));
+  const deltaOomKill = Math.max(0, (vm.oom_kill || 0) - (parseInt(baseline.VMSTAT_oom_kill, 10) || 0));
+  const oomKillsFormatted = deltaOomKill === 0 ? '✅ 0' : `⚠️ ${deltaOomKill}`;
+
+  // 5. Diskstats deltas
+  const disk = parseDiskstats(currentDiskstatsStr || '', baseline.DISK_DEVICES || '');
+  const deltaRdSectors = Math.max(0, disk.rdSectors - (parseInt(baseline.DISK_READ_SECTORS, 10) || 0));
+  const deltaRdIos = Math.max(0, disk.rdIos - (parseInt(baseline.DISK_READ_IOS, 10) || 0));
+  const deltaWrSectors = Math.max(0, disk.wrSectors - (parseInt(baseline.DISK_WRITE_SECTORS, 10) || 0));
+  const deltaWrIos = Math.max(0, disk.wrIos - (parseInt(baseline.DISK_WRITE_IOS, 10) || 0));
+  const deltaIoTicks = Math.max(0, disk.ioTicks - (parseInt(baseline.DISK_IO_TICKS_MS, 10) || 0));
+
+  const diskWritesFormatted = `${formatBytes(deltaWrSectors * 512)} (${formatNumber(deltaWrIos)} IOs)`;
+  const diskReadsFormatted = `${formatBytes(deltaRdSectors * 512)} (${formatNumber(deltaRdIos)} IOs)`;
+  const diskBusyPct = elapsedMs > 0 ? Math.min(100, (deltaIoTicks / elapsedMs) * 100).toFixed(1) + '%' : '0.0%';
+
+  // 6. Optimizations
+  // Rows: fsync bypass (scope), page cache, remount, git (env), apt tuning, build env, zram swap, tmpfs paths, profile
+  const optimizations = [];
+
+  // fsync bypass
+  const fsyncStatus = state.FSYNC_BYPASS || 'disabled';
+  let fsyncDetail = 'disabled';
+  if (fsyncStatus === 'active') {
+    const scope = state.PRELOAD_SCOPE || 'env';
+    fsyncDetail = `scope: ${scope} (${state.LD_PRELOAD_VALUE || 'libnosync.so'})`;
+    if (state.FSYNC_COMPILE_MS) {
+      fsyncDetail += ` [build: ${state.FSYNC_COMPILE_MS} ms]`;
+    }
+  } else if (fsyncStatus === 'failed') {
+    fsyncDetail = 'gcc build or install failed';
+  }
+  optimizations.push({
+    name: 'fsync bypass',
+    rawStatus: fsyncStatus,
+    status: statusEmoji(fsyncStatus),
+    detail: fsyncDetail,
+  });
+
+  // page cache
+  const cacheStatus = state.PAGE_CACHE || 'disabled';
+  let cacheDetail = 'disabled';
+  if (cacheStatus === 'active' || cacheStatus === 'partial') {
+    const swappiness = state.ZRAM_SWAP === 'active' ? '100' : '10';
+    cacheDetail = `dirty_ratio=45, dirty_background=15, swappiness=${swappiness}, vfs=50`;
+  } else if (cacheStatus === 'skipped') {
+    cacheDetail = 'non-root runner';
+  }
+  optimizations.push({
+    name: 'page cache',
+    rawStatus: cacheStatus,
+    status: statusEmoji(cacheStatus),
+    detail: cacheDetail,
+  });
+
+  // remount
+  const remountStatus = state.REMOUNT || 'disabled';
+  const remountDetail = state.REMOUNT_DETAIL || (remountStatus === 'active' ? 'noatime, barrier=0, commit=60' : 'disabled');
+  optimizations.push({
+    name: 'remount',
+    rawStatus: remountStatus,
+    status: statusEmoji(remountStatus),
+    detail: remountDetail,
+  });
+
+  // git (env)
+  const gitStatus = state.GIT_TUNING || 'disabled';
+  let gitDetail = 'disabled';
+  if (gitStatus === 'env') {
+    gitDetail = 'env-based (untrackedCache, checkout.workers, fetch.parallel, auto-gc off)';
+  } else if (gitStatus === 'skipped') {
+    gitDetail = 'git < 2.31 or not found';
+  }
+  optimizations.push({
+    name: 'git (env)',
+    rawStatus: gitStatus,
+    status: statusEmoji(gitStatus),
+    detail: gitDetail,
+  });
+
+  // apt tuning
+  const aptStatus = state.APT_TUNING || 'disabled';
+  let aptDetail = 'disabled';
+  if (aptStatus === 'active') {
+    aptDetail = 'force-unsafe-io, acquire::languages=none, timers stopped';
+  } else if (aptStatus === 'skipped') {
+    aptDetail = 'non-root runner';
+  }
+  optimizations.push({
+    name: 'apt tuning',
+    rawStatus: aptStatus,
+    status: statusEmoji(aptStatus),
+    detail: aptDetail,
+  });
+
+  // build env
+  const buildStatus = state.BUILD_ENV || 'disabled';
+  let buildDetail = 'disabled';
+  if (buildStatus === 'active') {
+    buildDetail = 'MAKEFLAGS, CMAKE_BUILD_PARALLEL_LEVEL, CARGO_INCREMENTAL=0, CARGO_NET_GIT_FETCH_WITH_CLI';
+  }
+  optimizations.push({
+    name: 'build env',
+    rawStatus: buildStatus,
+    status: statusEmoji(buildStatus),
+    detail: buildDetail,
+  });
+
+  // zram swap
+  const zramStatus = state.ZRAM_SWAP || 'disabled';
+  let zramDetail = 'disabled';
+  if (zramStatus === 'active') {
+    zramDetail = `${state.ZRAM_DEV || '/dev/zram0'} (${state.ZRAM_SIZE || '50%'}, ${state.ZRAM_ALGO || 'lz4'})`;
+  } else if (zramStatus === 'skipped') {
+    zramDetail = 'non-root runner';
+  } else if (zramStatus === 'unsupported') {
+    zramDetail = 'zram module unavailable';
+  }
+  optimizations.push({
+    name: 'zram swap',
+    rawStatus: zramStatus,
+    status: statusEmoji(zramStatus),
+    detail: zramDetail,
+  });
+
+  // tmpfs paths
+  const tmpfsStatus = state.TMPFS_PATHS || 'disabled';
+  let tmpfsDetail = 'disabled';
+  if (tmpfsStatus === 'active') {
+    tmpfsDetail = state.TMPFS_DETAIL || state.TMPFS_MOUNTED || 'mounted';
+  } else if (tmpfsStatus === 'skipped') {
+    tmpfsDetail = 'non-root runner';
+  }
+  optimizations.push({
+    name: 'tmpfs paths',
+    rawStatus: tmpfsStatus,
+    status: statusEmoji(tmpfsStatus),
+    detail: tmpfsDetail,
+  });
+
+  // profile
+  const profileStatus = state.PROFILE || 'hosted';
+  optimizations.push({
+    name: 'profile',
+    rawStatus: profileStatus,
+    status: statusEmoji(profileStatus),
+    detail: profileStatus,
+  });
+
+  // 7. Telemetry metrics
+  const telemetry = [
+    { metric: 'Elapsed time', value: elapsedSec },
+    { metric: 'CPU iowait avg', value: cpuDelta.iowaitPct },
+    { metric: 'CPU user+sys', value: cpuDelta.userSysPct },
+    { metric: 'Dirty now', value: dirtyFormatted },
+    { metric: 'Writeback now', value: writebackFormatted },
+    { metric: 'Memory available / total', value: memAvailFormatted },
+    { metric: 'Page cache', value: cachedFormatted },
+    { metric: 'Swap used', value: swapUsedFormatted },
+    { metric: 'Data written to page cache (nr_dirtied)', value: dataWrittenPageCache },
+    { metric: 'Physical disk writes', value: diskWritesFormatted },
+    { metric: 'Physical disk reads', value: diskReadsFormatted },
+    { metric: 'Disk busy %', value: diskBusyPct },
+    { metric: 'Swap-out (pswpout)', value: `${formatNumber(deltaPswpout)} pages` },
+    { metric: 'OOM kills', value: oomKillsFormatted },
+  ];
+
+  // 8. zram swap table
+  let zramData = null;
+  if (zramStatus === 'active') {
+    zramData = zramInfoOverride || getZramInfo(state.ZRAM_DEV, state);
+    zramData.active = true;
+  }
+
+  // 9. Footer
+  const setupMs = state.SETUP_SCRIPT_MS || 'n/a';
+  const arch = os.arch();
+  const kernel = os.release();
+  const runnerEnv = process.env.RUNNER_ENVIRONMENT || 'github-hosted';
+  const footer = `Setup time: ${setupMs} ms | Architecture: ${arch} | Kernel: ${kernel} | Runner: ${runnerEnv}`;
+
+  return {
+    optimizations,
+    nosyncImpact: nosyncStats,
+    telemetry,
+    zram: zramData,
+    footer,
   };
 }
 
@@ -375,7 +633,7 @@ function getZramInfo(devName, state, workspace) {
  * @param {object} params
  * @returns {string}
  */
-function generateMarkdown({ optimizations, telemetry, zram, footer }) {
+function generateMarkdown({ optimizations, nosyncImpact, telemetry, zram, footer }) {
   const lines = [];
 
   lines.push('## ⚡ overclock');
@@ -391,7 +649,19 @@ function generateMarkdown({ optimizations, telemetry, zram, footer }) {
   }
   lines.push('');
 
-  // Table 2: System I/O Telemetry
+  // Table 2: fsync Bypass Impact (if any events or active)
+  if (nosyncImpact && (nosyncImpact.skippedSync > 0 || nosyncImpact.strippedOsync > 0 || nosyncImpact.processes > 0)) {
+    lines.push('### fsync Bypass Impact');
+    lines.push('');
+    lines.push('| Metric | Value |');
+    lines.push('|---|---|');
+    lines.push(`| Sync calls skipped | ${formatNumber(nosyncImpact.skippedSync)} |`);
+    lines.push(`| O_SYNC / O_DSYNC stripped | ${formatNumber(nosyncImpact.strippedOsync)} |`);
+    lines.push(`| Processes accelerated | ${formatNumber(nosyncImpact.processes)} |`);
+    lines.push('');
+  }
+
+  // Table 3: System I/O Telemetry
   lines.push('### System I/O Telemetry');
   lines.push('');
   lines.push('| Metric | Value |');
@@ -401,9 +671,9 @@ function generateMarkdown({ optimizations, telemetry, zram, footer }) {
   }
   lines.push('');
 
-  // Table 3: zram Workspace (if active)
+  // Table 4: zram Swap (if active)
   if (zram && zram.active) {
-    lines.push('### zram Workspace');
+    lines.push('### zram Swap');
     lines.push('');
     lines.push('| Property | Value |');
     lines.push('|---|---|');
@@ -414,7 +684,6 @@ function generateMarkdown({ optimizations, telemetry, zram, footer }) {
     lines.push(`| Compressed Data | ${escapeMarkdown(zram.compr)} |`);
     lines.push(`| Compression Ratio | ${escapeMarkdown(zram.ratio)} |`);
     lines.push(`| Total Memory Used | ${escapeMarkdown(zram.total)} |`);
-    lines.push(`| Workspace Usage | ${escapeMarkdown(zram.wsUsage)} |`);
     lines.push('');
   }
 
@@ -433,245 +702,33 @@ function generateMarkdown({ optimizations, telemetry, zram, footer }) {
  * @param {object} params
  * @returns {string}
  */
-function generatePlainTextSummary({ optimizations, telemetry }) {
+function generatePlainTextSummary({ optimizations, nosyncImpact, telemetry }) {
   const optSummary = optimizations.map(o => `${o.name}: ${o.rawStatus || o.status}`).join(' | ');
   const metricMap = {};
   for (const t of telemetry) {
     metricMap[t.metric] = t.value;
   }
 
-  return [
+  const lines = [
     '⚡ overclock telemetry summary:',
     `  Optimizations: ${optSummary}`,
-    `  I/O: writes=${metricMap['Physical disk writes'] || 'n/a'}, reads=${metricMap['Physical disk reads'] || 'n/a'}, disk-busy=${metricMap['Disk busy %'] || '0.0%'}, iowait=${metricMap['CPU iowait avg'] || '0.0%'}`,
-    `  Memory: available/total=${metricMap['Memory available / total'] || 'n/a'}, dirty=${metricMap['Dirty now'] || 'n/a'}, page-cache=${metricMap['Page cache'] || 'n/a'}`,
-    `  Elapsed: ${metricMap['Elapsed time'] || '0.00s'}`,
-  ].join('\n');
-}
-
-/**
- * Pure telemetry computation helper given parsed inputs and raw strings.
- *
- * @param {object} params
- * @returns {object}
- */
-function computeTelemetryData({
-  baseline,
-  state,
-  currentCpuStat,
-  currentMeminfoStr,
-  currentVmstatStr,
-  currentDiskstatsStr,
-  currentUptimeStr,
-  mountinfoStr,
-  zramInfoOverride,
-  workspace,
-  nowMs = Date.now(),
-}) {
-  const base = baseline || {};
-  const st = state || {};
-
-  // 1. Elapsed time
-  let elapsedMs = 0;
-  if (base.START_EPOCH_MS) {
-    elapsedMs = Math.max(0, nowMs - parseInt(base.START_EPOCH_MS, 10));
-  } else if (base.START_UPTIME && currentUptimeStr) {
-    const curUp = parseFloat(currentUptimeStr.trim().split(/\s+/)[0]) || 0;
-    const baseUp = parseFloat(base.START_UPTIME) || 0;
-    elapsedMs = Math.max(0, Math.round((curUp - baseUp) * 1000));
-  }
-  const elapsedSec = (elapsedMs / 1000).toFixed(2) + 's';
-
-  // 2. CPU delta
-  const cpuDelta = computeCpuDelta(base.CPU_STAT || '', currentCpuStat || '');
-
-  // 3. Memory info
-  const mem = parseMeminfo(currentMeminfoStr || '');
-  const memAvailFormatted = `${formatBytes(mem.memAvailable)} / ${formatBytes(mem.memTotal)}`;
-  const dirtyFormatted = formatBytes(mem.dirty);
-  const writebackFormatted = formatBytes(mem.writeback);
-  const cachedFormatted = formatBytes(mem.cached);
-  const swapUsedFormatted = formatBytes(mem.swapUsed);
-
-  // 4. Vmstat deltas
-  const vm = parseVmstat(currentVmstatStr || '');
-  const deltaNrDirtied = Math.max(0, (vm.nr_dirtied || 0) - (parseInt(base.VMSTAT_nr_dirtied, 10) || 0));
-  const dataWrittenPageCache = formatBytes(deltaNrDirtied * 4096);
-  const deltaPswpout = Math.max(0, (vm.pswpout || 0) - (parseInt(base.VMSTAT_pswpout, 10) || 0));
-  const deltaOomKill = Math.max(0, (vm.oom_kill || 0) - (parseInt(base.VMSTAT_oom_kill, 10) || 0));
-  const oomKillsFormatted = deltaOomKill === 0 ? '✅ 0' : `⚠️ ${deltaOomKill}`;
-
-  // 5. Diskstats deltas
-  const disk = parseDiskstats(currentDiskstatsStr || '', base.DISK_DEVICES || '');
-  const deltaRdSectors = Math.max(0, disk.rdSectors - (parseInt(base.DISK_READ_SECTORS, 10) || 0));
-  const deltaRdIos = Math.max(0, disk.rdIos - (parseInt(base.DISK_READ_IOS, 10) || 0));
-  const deltaWrSectors = Math.max(0, disk.wrSectors - (parseInt(base.DISK_WRITE_SECTORS, 10) || 0));
-  const deltaWrIos = Math.max(0, disk.wrIos - (parseInt(base.DISK_WRITE_IOS, 10) || 0));
-  const deltaIoTicks = Math.max(0, disk.ioTicks - (parseInt(base.DISK_IO_TICKS_MS, 10) || 0));
-
-  const diskWritesFormatted = `${formatBytes(deltaWrSectors * 512)} (${formatNumber(deltaWrIos)} IOs)`;
-  const diskReadsFormatted = `${formatBytes(deltaRdSectors * 512)} (${formatNumber(deltaRdIos)} IOs)`;
-  const diskBusyPct = elapsedMs > 0 ? Math.min(100, (deltaIoTicks / elapsedMs) * 100).toFixed(1) + '%' : '0.0%';
-
-  // 6. Optimizations
-  const optimizations = [];
-
-  // Fsync bypass
-  const fsyncStatus = st.FSYNC_BYPASS || 'disabled';
-  let fsyncDetail = 'disabled';
-  if (fsyncStatus === 'active') {
-    fsyncDetail = `LD_PRELOAD=${st.LD_PRELOAD_VALUE || 'libnosync.so'}`;
-    if (st.FSYNC_COMPILE_MS) {
-      fsyncDetail += ` (build: ${st.FSYNC_COMPILE_MS} ms)`;
-    }
-  } else if (fsyncStatus === 'failed') {
-    fsyncDetail = 'gcc build or preload failed';
-  }
-  optimizations.push({
-    name: 'fsync bypass',
-    rawStatus: fsyncStatus,
-    status: statusEmoji(fsyncStatus),
-    detail: fsyncDetail,
-  });
-
-  // Page cache tuning
-  const cacheStatus = st.PAGE_CACHE || 'disabled';
-  let cacheDetail = 'disabled';
-  if (cacheStatus === 'active' || cacheStatus === 'partial') {
-    cacheDetail = 'dirty_ratio=80, dirty_background=50, swappiness=10';
-  } else if (cacheStatus === 'skipped') {
-    cacheDetail = 'non-root runner';
-  }
-  optimizations.push({
-    name: 'page cache tuning',
-    rawStatus: cacheStatus,
-    status: statusEmoji(cacheStatus),
-    detail: cacheDetail,
-  });
-
-  // Filesystem remount
-  const remountStatus = st.REMOUNT || 'disabled';
-  const remountDetail = st.REMOUNT_DETAIL || (remountStatus === 'active' ? 'noatime, barrier=0, commit=600' : 'disabled');
-  optimizations.push({
-    name: 'filesystem remount',
-    rawStatus: remountStatus,
-    status: statusEmoji(remountStatus),
-    detail: remountDetail,
-  });
-
-  // Git tuning
-  const gitStatus = st.GIT_TUNING || 'disabled';
-  let gitDetail = 'disabled';
-  if (gitStatus === 'system') {
-    gitDetail = 'system-wide (feature.manyFiles, untrackedCache, threads)';
-  } else if (gitStatus === 'global') {
-    gitDetail = 'user-global (feature.manyFiles, untrackedCache, threads)';
-  }
-  optimizations.push({
-    name: 'git tuning',
-    rawStatus: gitStatus,
-    status: statusEmoji(gitStatus),
-    detail: gitDetail,
-  });
-
-  // zram workspace
-  const zramStatus = st.ZRAM || 'disabled';
-  let zramDetail = 'disabled';
-  if (zramStatus === 'active') {
-    zramDetail = `${st.ZRAM_DEV || '/dev/zram0'} (${st.ZRAM_SIZE || '6G'}, ${st.ZRAM_ALGO || 'lz4'})`;
-  } else if (zramStatus === 'skipped') {
-    zramDetail = 'non-root runner';
-  } else if (zramStatus === 'unsupported') {
-    zramDetail = 'zram module unavailable';
-  }
-  optimizations.push({
-    name: 'zram workspace',
-    rawStatus: zramStatus,
-    status: statusEmoji(zramStatus),
-    detail: zramDetail,
-  });
-
-  // Spill dirs
-  let spillStatus = 'disabled';
-  let spillDetail = 'disabled';
-  if (zramStatus === 'active') {
-    const bound = Array.isArray(st.SPILL_BOUND) ? st.SPILL_BOUND : (st.SPILL_BOUND ? [st.SPILL_BOUND] : []);
-    const skipped = Array.isArray(st.SPILL_SKIPPED) ? st.SPILL_SKIPPED : (st.SPILL_SKIPPED ? [st.SPILL_SKIPPED] : []);
-
-    let mountPoints = new Set();
-    if (mountinfoStr) {
-      mountPoints = parseMountinfo(mountinfoStr);
-    }
-
-    const verifiedBound = [];
-    for (const b of bound) {
-      const fullPath = workspace ? path.resolve(workspace, b) : b;
-      if (mountinfoStr && !mountPoints.has(fullPath)) {
-        verifiedBound.push(`${b} (unmounted)`);
-      } else {
-        verifiedBound.push(b);
-      }
-    }
-
-    if (verifiedBound.length > 0) {
-      spillStatus = 'active';
-      spillDetail = `bound: ${verifiedBound.join(', ')}`;
-      if (skipped.length > 0) {
-        spillDetail += ` | skipped: ${skipped.join(', ')}`;
-      }
-    } else if (skipped.length > 0) {
-      spillStatus = 'partial';
-      spillDetail = `skipped: ${skipped.join(', ')}`;
-    } else if (st.SPILL_DIRS) {
-      spillStatus = 'disabled';
-      spillDetail = `none bound (${st.SPILL_DIRS})`;
-    }
-  }
-  optimizations.push({
-    name: 'spill dirs',
-    rawStatus: spillStatus,
-    status: statusEmoji(spillStatus),
-    detail: spillDetail,
-  });
-
-  // 7. Telemetry table metrics
-  const telemetry = [
-    { metric: 'Elapsed time', value: elapsedSec },
-    { metric: 'CPU iowait avg', value: cpuDelta.iowaitPct },
-    { metric: 'CPU user+sys', value: cpuDelta.userSysPct },
-    { metric: 'Dirty now', value: dirtyFormatted },
-    { metric: 'Writeback now', value: writebackFormatted },
-    { metric: 'Memory available / total', value: memAvailFormatted },
-    { metric: 'Page cache', value: cachedFormatted },
-    { metric: 'Swap used', value: swapUsedFormatted },
-    { metric: 'Data written to page cache (nr_dirtied)', value: dataWrittenPageCache },
-    { metric: 'Physical disk writes', value: diskWritesFormatted },
-    { metric: 'Physical disk reads', value: diskReadsFormatted },
-    { metric: 'Disk busy %', value: diskBusyPct },
-    { metric: 'Swap-out (pswpout)', value: `${formatNumber(deltaPswpout)} pages` },
-    { metric: 'OOM kills', value: oomKillsFormatted },
   ];
 
-  // 8. zram table details
-  let zramData = null;
-  if (zramStatus === 'active') {
-    zramData = zramInfoOverride || getZramInfo(st.ZRAM_DEV, st, workspace);
-    zramData.active = true;
+  if (nosyncImpact && (nosyncImpact.skippedSync > 0 || nosyncImpact.strippedOsync > 0 || nosyncImpact.processes > 0)) {
+    lines.push(
+      `  fsync impact: skipped ${formatNumber(nosyncImpact.skippedSync)} sync calls, stripped ${formatNumber(nosyncImpact.strippedOsync)} O_SYNC flags across ${formatNumber(nosyncImpact.processes)} processes`
+    );
   }
 
-  // 9. Footer
-  const setupMs = st.SETUP_SCRIPT_MS || 'n/a';
-  const arch = os.arch();
-  const kernel = os.release();
-  const runnerEnv = process.env.RUNNER_ENVIRONMENT || 'github-hosted';
-  const footer = `Setup time: ${setupMs} ms | Architecture: ${arch} | Kernel: ${kernel} | Runner: ${runnerEnv}`;
+  lines.push(
+    `  I/O: writes=${metricMap['Physical disk writes'] || 'n/a'}, reads=${metricMap['Physical disk reads'] || 'n/a'}, disk-busy=${metricMap['Disk busy %'] || '0.0%'}, iowait=${metricMap['CPU iowait avg'] || '0.0%'}`
+  );
+  lines.push(
+    `  Memory: available/total=${metricMap['Memory available / total'] || 'n/a'}, dirty=${metricMap['Dirty now'] || 'n/a'}, page-cache=${metricMap['Page cache'] || 'n/a'}`
+  );
+  lines.push(`  Elapsed: ${metricMap['Elapsed time'] || '0.00s'}`);
 
-  return {
-    optimizations,
-    telemetry,
-    zram: zramData,
-    footer,
-  };
+  return lines.join('\n');
 }
 
 /**
@@ -683,34 +740,41 @@ function run() {
       return;
     }
 
-    const stateFile = process.env.STATE_state_file || '/tmp/overclock-state.env';
-    const metricsFile = process.env.STATE_metrics_file || '/tmp/overclock-metrics-start.env';
-    const rawSummary = process.env.STATE_summary !== undefined ? process.env.STATE_summary : (process.env.INPUT_SUMMARY || 'true');
+    const stateDir =
+      process.env.STATE_state_dir ||
+      (process.env.RUNNER_TEMP ? path.join(process.env.RUNNER_TEMP, 'overclock') : path.join(os.tmpdir(), 'overclock'));
+
+    const stateFile = path.join(stateDir, 'state.env');
+    const metricsFile = path.join(stateDir, 'metrics-start.env');
+    const statsFile = path.join(stateDir, 'nosync-stats');
+
+    const rawSummary =
+      process.env.STATE_summary !== undefined ? process.env.STATE_summary : (process.env.INPUT_SUMMARY || 'true');
     const summaryEnabled = parseBool(rawSummary, true);
-    const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
 
     const baselineRaw = safeReadFile(metricsFile);
     const baseline = parseEnvFile(baselineRaw || '');
     const stateRaw = safeReadFile(stateFile);
     const state = parseEnvFile(stateRaw || '');
 
+    const nosyncRaw = safeReadFile(statsFile);
+    const nosyncStats = parseNosyncStats(nosyncRaw || '');
+
     const currentCpuStat = safeReadFile('/proc/stat');
     const currentMeminfo = safeReadFile('/proc/meminfo');
     const currentVmstat = safeReadFile('/proc/vmstat');
     const currentDiskstats = safeReadFile('/proc/diskstats');
     const currentUptime = safeReadFile('/proc/uptime');
-    const currentMountinfo = safeReadFile('/proc/self/mountinfo');
 
     const data = computeTelemetryData({
       baseline,
       state,
+      nosyncStats,
       currentCpuStat,
       currentMeminfoStr: currentMeminfo,
       currentVmstatStr: currentVmstat,
       currentDiskstatsStr: currentDiskstats,
       currentUptimeStr: currentUptime,
-      mountinfoStr: currentMountinfo,
-      workspace,
     });
 
     const plainText = generatePlainTextSummary(data);
@@ -721,12 +785,13 @@ function run() {
       appendGithubSummary(markdown);
     }
 
-    // Self-hosted cleanup if applicable
-    if (process.env.RUNNER_ENVIRONMENT === 'self-hosted' && (state.ZRAM === 'active' || state.ORIG_SYSCTL)) {
+    // Self-hosted teardown if applicable
+    const runnerEnv = process.env.RUNNER_ENVIRONMENT || 'github-hosted';
+    const isPrivileged = parseBool(process.env.STATE_privileged, false);
+    if (runnerEnv === 'self-hosted' && isPrivileged) {
       const actionPath = path.resolve(__dirname, '..');
       const teardownEnv = {
-        OVERCLOCK_STATE_FILE: stateFile,
-        OVERCLOCK_WORKSPACE: workspace,
+        OVERCLOCK_STATE_DIR: stateDir,
       };
       runRootScript(path.join(actionPath, 'src', 'setup-linux.sh'), ['teardown'], teardownEnv);
     }
@@ -741,6 +806,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  parseNosyncStats,
   parseCpuStat,
   computeCpuDelta,
   parseMeminfo,
