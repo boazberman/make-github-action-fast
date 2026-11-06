@@ -1,6 +1,6 @@
 # overclock
 
-A lightweight, zero-dependency GitHub Action that accelerates Linux CI workflows by eliminating disk I/O bottlenecks. In ephemeral CI runners, disk durability guarantees—such as synchronous writes, ext4 journal barriers, and frequent dirty page flushes—introduce latency without providing reliability benefits, since the runner VM is discarded immediately after the job finishes. The biggest performance wins come from fsync-heavy workloads such as SQLite or embedded database test suites and `dpkg`/`apt` package installations, where hundreds or thousands of redundant sync calls are eliminated. Standard application workflows (`npm ci`, `pip install`, `cargo build`) typically see smaller, modest gains because their runtime is predominantly dominated by network downloads or CPU compilation. Setup executes in the background and is typically well under a second, compiling an fsync-interposition library on the fly with no third-party npm dependencies. `overclock` adheres strictly to a zero-failure rule: if any privileged kernel or mount operation is restricted (such as in unprivileged containers or restricted self-hosted environments), it logs a warning and degrades gracefully without failing your build.
+A lightweight, zero-dependency GitHub Action that accelerates Linux CI workflows by eliminating disk I/O bottlenecks. In ephemeral CI runners, disk durability guarantees—such as synchronous writes, ext4 journal barriers, and frequent dirty page flushes—introduce latency without providing reliability benefits, since the runner VM is discarded immediately after the job finishes. The large, measured win is for fsync-heavy workloads such as SQLite or embedded-database test suites (7–16× on a synthetic commit benchmark; see [Benchmarks](#benchmarks)). Everything else, including `apt`, `npm ci`, `pip install` and `cargo build`, measured within noise (0.97–1.03×) on GitHub-hosted runners, because syncs there are cheap and these tools are mostly CPU- or network-bound. If your job doesn't do lots of synchronous database commits, don't expect a visible speedup. Setup typically takes 300–400 ms, compiling an fsync-interposition library on the fly with no third-party npm dependencies. `overclock` adheres strictly to a zero-failure rule: if any privileged kernel or mount operation is restricted (such as in unprivileged containers or restricted self-hosted environments), it logs a warning and degrades gracefully without failing your build.
 
 ---
 
@@ -149,7 +149,7 @@ This configuration requires Git &ge; 2.31 (which introduced `GIT_CONFIG_KEY_<n>`
 
 ### 5. Apt Tuning (`apt-tuning`)
 
-Package updates and installations during CI frequently stall on disk synchronization and post-install hooks. When privileged, `overclock` applies system-level apt optimizations:
+Package installs during CI can stall on disk synchronization and post-install hooks (on GitHub-hosted runners the measured gain was within noise; it may matter more on slower self-hosted disks). When privileged, `overclock` applies system-level apt optimizations:
 
 - **`force-unsafe-io`**: Writes `/etc/dpkg/dpkg.cfg.d/overclock-unsafe-io` with `force-unsafe-io`. This instructs `dpkg` to skip `fsync()` when unpacking and configuring packages.
 - **Disable translation downloads**: Writes `/etc/apt/apt.conf.d/99overclock` containing `Acquire::Languages "none";`, preventing `apt update` from downloading localized package index translations.
@@ -304,7 +304,26 @@ Workloads evaluated:
 - **`cargo-build`**: Clean compilation of a Rust crate with pre-fetched dependencies.
 
 <!-- BENCH-RESULTS:START -->
-_Results pending._
+Measured 2026-11-06 on GitHub-hosted runners. Speedup = baseline median / config median, 5 interleaved reps per config in the same VM. "sig." means the 95% bootstrap CI of the ratio excludes 1.0.
+
+| Workload | `ubuntu-24.04` (x86_64), `all` | `ubuntu-24.04-arm`, `all` | fsyncs skipped |
+|---|---|---|---|
+| SQLite, 2,000 `synchronous=FULL` commits | **6.96×** (1,349 → 194 ms, sig.) | **15.8×** (1,339 → 85 ms, sig.) | 40,020 |
+| 30k small files: extract + git add/commit + rm | 1.02× (sig.) | 1.03× (sig.) | 0 |
+| `apt-get install --reinstall` (offline) | 0.98× (n.s.) | 0.97× (n.s.) | ~78,600 |
+| `npm ci` (offline cache) | 1.01× (n.s.) | 1.01× (n.s.) | 0 |
+| `pip install` (offline wheels) | 1.01× (n.s.) | 1.01× (n.s.) | 180 |
+| `cargo build` (deps prefetched) | 1.01× (n.s.) | 1.01× (n.s.) | 0 |
+
+Real projects (`ubuntu-24.04`, `baseline` vs `all`, 3 reps, three separate workflow runs):
+
+| Project | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| vue-core (install + build + unit tests) | 1.02× | 0.99× | 1.02× |
+| ripgrep (release build + tests) | 1.00× | 1.00× | 1.00× |
+| redis (build) | 1.04× | 1.00× | 1.00× |
+
+**Takeaways.** fsync on hosted runners costs roughly 30 µs, so skipping it only matters when a workload issues tens of thousands of *serialised* syncs (database commits). Package managers and compilers barely sync, so expect gains within noise for typical npm/pip/cargo/make jobs. Absolute times varied by up to 40% between runs because runners land on different hardware, which is why the comparison is done in-VM.
 <!-- BENCH-RESULTS:END -->
 
 ### Reproducing Benchmarks
