@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# make-github-action-fast - Linux root optimization engine
+# overclock - Linux root optimization engine
 # Modes: setup (default), spill-helper, teardown
 
 set -uo pipefail
 
-GHFAST_ACTION_PATH="${GHFAST_ACTION_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-GHFAST_FSYNC_BYPASS="${GHFAST_FSYNC_BYPASS:-true}"
-GHFAST_PAGE_CACHE="${GHFAST_PAGE_CACHE:-true}"
-GHFAST_REMOUNT="${GHFAST_REMOUNT:-true}"
-GHFAST_GIT_TUNING="${GHFAST_GIT_TUNING:-true}"
-GHFAST_ZRAM="${GHFAST_ZRAM:-false}"
-GHFAST_ZRAM_SIZE="${GHFAST_ZRAM_SIZE:-6G}"
-GHFAST_SPILL_DIRS="${GHFAST_SPILL_DIRS:-node_modules,.cargo,.gradle,.venv,target}"
-GHFAST_WORKSPACE="${GHFAST_WORKSPACE:-$(pwd)}"
-GHFAST_UID="${GHFAST_UID:-$(id -u)}"
-GHFAST_GID="${GHFAST_GID:-$(id -g)}"
-GHFAST_STATE_FILE="${GHFAST_STATE_FILE:-/tmp/gh-fast-state.env}"
-GHFAST_METRICS_FILE="${GHFAST_METRICS_FILE:-/tmp/gh-fast-metrics-start.env}"
-GHFAST_LIB_FALLBACK_DIR="${GHFAST_LIB_FALLBACK_DIR:-/tmp/gh-fast-lib}"
-GHFAST_START_EPOCH_MS="${GHFAST_START_EPOCH_MS:-}"
-GHFAST_ARM_MODE="${GHFAST_ARM_MODE:-any_entry}"
+OVERCLOCK_ACTION_PATH="${OVERCLOCK_ACTION_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+OVERCLOCK_FSYNC_BYPASS="${OVERCLOCK_FSYNC_BYPASS:-true}"
+OVERCLOCK_PAGE_CACHE="${OVERCLOCK_PAGE_CACHE:-true}"
+OVERCLOCK_REMOUNT="${OVERCLOCK_REMOUNT:-true}"
+OVERCLOCK_GIT_TUNING="${OVERCLOCK_GIT_TUNING:-true}"
+OVERCLOCK_ZRAM="${OVERCLOCK_ZRAM:-false}"
+OVERCLOCK_ZRAM_SIZE="${OVERCLOCK_ZRAM_SIZE:-6G}"
+OVERCLOCK_SPILL_DIRS="${OVERCLOCK_SPILL_DIRS:-node_modules,.cargo,.gradle,.venv,target}"
+OVERCLOCK_WORKSPACE="${OVERCLOCK_WORKSPACE:-$(pwd)}"
+OVERCLOCK_UID="${OVERCLOCK_UID:-$(id -u)}"
+OVERCLOCK_GID="${OVERCLOCK_GID:-$(id -g)}"
+OVERCLOCK_STATE_FILE="${OVERCLOCK_STATE_FILE:-/tmp/overclock-state.env}"
+OVERCLOCK_METRICS_FILE="${OVERCLOCK_METRICS_FILE:-/tmp/overclock-metrics-start.env}"
+OVERCLOCK_LIB_FALLBACK_DIR="${OVERCLOCK_LIB_FALLBACK_DIR:-/tmp/overclock-lib}"
+OVERCLOCK_START_EPOCH_MS="${OVERCLOCK_START_EPOCH_MS:-}"
+OVERCLOCK_ARM_MODE="${OVERCLOCK_ARM_MODE:-any_entry}"
 
 IS_ROOT="false"
 if [[ "$(id -u)" -eq 0 ]]; then
@@ -27,21 +27,21 @@ if [[ "$(id -u)" -eq 0 ]]; then
 fi
 
 log() {
-  printf '[gh-fast] %s\n' "$1"
+  printf '[overclock] %s\n' "$1"
 }
 
 warn() {
-  printf '::warning title=make-github-action-fast::%s\n' "$1"
+  printf '::warning title=overclock::%s\n' "$1"
 }
 
 state() {
-  printf '%s=%s\n' "$1" "$2" >> "$GHFAST_STATE_FILE"
+  printf '%s=%s\n' "$1" "$2" >> "$OVERCLOCK_STATE_FILE"
 }
 
 bind_spill_dir() {
   local dir="$1"
-  local target="$GHFAST_WORKSPACE/$dir"
-  local source="/mnt/gh-fast-spill/$dir"
+  local target="$OVERCLOCK_WORKSPACE/$dir"
+  local source="/mnt/overclock-spill/$dir"
 
   if findmnt -rn -o TARGET --mountpoint "$target" >/dev/null 2>&1; then
     return 0
@@ -59,13 +59,13 @@ bind_spill_dir() {
   fi
 
   mkdir -p "$target" 2>/dev/null || true
-  chown "$GHFAST_UID:$GHFAST_GID" "$target" 2>/dev/null || true
+  chown "$OVERCLOCK_UID:$OVERCLOCK_GID" "$target" 2>/dev/null || true
 
   local p="$dir"
   while [[ "$p" != "." && "$p" != "/" ]]; do
     p="$(dirname "$p")"
-    if [[ "$p" != "." && "$p" != "/" && -d "$GHFAST_WORKSPACE/$p" ]]; then
-      chown "$GHFAST_UID:$GHFAST_GID" "$GHFAST_WORKSPACE/$p" 2>/dev/null || true
+    if [[ "$p" != "." && "$p" != "/" && -d "$OVERCLOCK_WORKSPACE/$p" ]]; then
+      chown "$OVERCLOCK_UID:$OVERCLOCK_GID" "$OVERCLOCK_WORKSPACE/$p" 2>/dev/null || true
     fi
   done
 
@@ -77,14 +77,14 @@ bind_spill_dir() {
 }
 
 mode_spill_helper() {
-  echo "$$" > /tmp/gh-fast-spill-helper.pid 2>/dev/null || true
-  local arm_mode="$GHFAST_ARM_MODE"
+  echo "$$" > /tmp/overclock-spill-helper.pid 2>/dev/null || true
+  local arm_mode="$OVERCLOCK_ARM_MODE"
   local start_time
   start_time="$(date +%s)"
   local armed=0
 
   local fifo
-  fifo="$(mktemp -u /tmp/gh-fast-helper-fifo.XXXXXX)"
+  fifo="$(mktemp -u /tmp/overclock-helper-fifo.XXXXXX)"
   mkfifo "$fifo" 2>/dev/null || true
   exec 3<>"$fifo" 2>/dev/null || true
   rm -f "$fifo" 2>/dev/null || true
@@ -101,7 +101,7 @@ mode_spill_helper() {
     fi
 
     local src
-    src="$(findmnt -rn -o SOURCE --mountpoint "$GHFAST_WORKSPACE" 2>/dev/null || true)"
+    src="$(findmnt -rn -o SOURCE --mountpoint "$OVERCLOCK_WORKSPACE" 2>/dev/null || true)"
     if [[ ! "$src" =~ ^/dev/zram ]]; then
       exec 3>&- 2>/dev/null || true
       exit 0
@@ -111,13 +111,13 @@ mode_spill_helper() {
       if [[ "$arm_mode" == "any_entry" ]]; then
         local entries=()
         shopt -s nullglob dotglob
-        entries=("$GHFAST_WORKSPACE"/*)
+        entries=("$OVERCLOCK_WORKSPACE"/*)
         shopt -u nullglob dotglob
         if [[ ${#entries[@]} -gt 0 ]]; then
           armed=1
         fi
       elif [[ "$arm_mode" == "git_or_timeout" ]]; then
-        if [[ -e "$GHFAST_WORKSPACE/.git" || "$elapsed" -ge 300 ]]; then
+        if [[ -e "$OVERCLOCK_WORKSPACE/.git" || "$elapsed" -ge 300 ]]; then
           armed=1
         fi
       fi
@@ -125,7 +125,7 @@ mode_spill_helper() {
 
     if [[ "$armed" -eq 1 ]]; then
       local spill_array=()
-      IFS=',' read -r -a spill_array <<< "$GHFAST_SPILL_DIRS"
+      IFS=',' read -r -a spill_array <<< "$OVERCLOCK_SPILL_DIRS"
       for dir in "${spill_array[@]}"; do
         [[ -n "$dir" ]] || continue
         bind_spill_dir "$dir"
@@ -147,8 +147,8 @@ mode_teardown() {
   log "Teardown initiated"
 
   local helper_pid=""
-  if [[ -f /tmp/gh-fast-spill-helper.pid ]]; then
-    read -r helper_pid < /tmp/gh-fast-spill-helper.pid 2>/dev/null || true
+  if [[ -f /tmp/overclock-spill-helper.pid ]]; then
+    read -r helper_pid < /tmp/overclock-spill-helper.pid 2>/dev/null || true
   fi
   if [[ -n "$helper_pid" ]]; then
     if kill -0 "$helper_pid" 2>/dev/null; then
@@ -158,31 +158,31 @@ mode_teardown() {
         kill -9 "$helper_pid" 2>/dev/null || true
       fi
     fi
-    rm -f /tmp/gh-fast-spill-helper.pid 2>/dev/null || true
+    rm -f /tmp/overclock-spill-helper.pid 2>/dev/null || true
   fi
 
   local bound_dirs=()
   local zram_dev=""
   local orig_sysctl=""
-  if [[ -f "$GHFAST_STATE_FILE" ]]; then
+  if [[ -f "$OVERCLOCK_STATE_FILE" ]]; then
     while IFS='=' read -r k v || [[ -n "$k" ]]; do
       case "$k" in
         SPILL_BOUND) bound_dirs+=("$v") ;;
         ZRAM_DEV) zram_dev="$v" ;;
         ORIG_SYSCTL) orig_sysctl="$v" ;;
       esac
-    done < "$GHFAST_STATE_FILE"
+    done < "$OVERCLOCK_STATE_FILE"
   fi
 
   for dir in "${bound_dirs[@]}"; do
     [[ -n "$dir" ]] || continue
-    umount -l "$GHFAST_WORKSPACE/$dir" 2>/dev/null || true
+    umount -l "$OVERCLOCK_WORKSPACE/$dir" 2>/dev/null || true
   done
 
   local src
-  src="$(findmnt -rn -o SOURCE --mountpoint "$GHFAST_WORKSPACE" 2>/dev/null || true)"
+  src="$(findmnt -rn -o SOURCE --mountpoint "$OVERCLOCK_WORKSPACE" 2>/dev/null || true)"
   if [[ "$src" =~ ^/dev/zram ]]; then
-    umount -l "$GHFAST_WORKSPACE" 2>/dev/null || true
+    umount -l "$OVERCLOCK_WORKSPACE" 2>/dev/null || true
   fi
 
   if [[ -n "$zram_dev" && -b "$zram_dev" ]]; then
@@ -211,24 +211,24 @@ mode_setup() {
   script_start_ms="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
 
   # Truncate and prep state file
-  : > "$GHFAST_STATE_FILE"
-  chmod 0644 "$GHFAST_STATE_FILE" 2>/dev/null || true
+  : > "$OVERCLOCK_STATE_FILE"
+  chmod 0644 "$OVERCLOCK_STATE_FILE" 2>/dev/null || true
 
   # 1. Baseline telemetry -> metrics file
-  : > "$GHFAST_METRICS_FILE"
-  chmod 0644 "$GHFAST_METRICS_FILE" 2>/dev/null || true
+  : > "$OVERCLOCK_METRICS_FILE"
+  chmod 0644 "$OVERCLOCK_METRICS_FILE" 2>/dev/null || true
 
-  local start_epoch="$GHFAST_START_EPOCH_MS"
+  local start_epoch="$OVERCLOCK_START_EPOCH_MS"
   if [[ -z "$start_epoch" ]]; then
     start_epoch="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
   fi
-  printf 'START_EPOCH_MS=%s\n' "$start_epoch" >> "$GHFAST_METRICS_FILE"
+  printf 'START_EPOCH_MS=%s\n' "$start_epoch" >> "$OVERCLOCK_METRICS_FILE"
 
   local start_uptime="0"
   if [[ -r /proc/uptime ]]; then
     read -r start_uptime _ < /proc/uptime || true
   fi
-  printf 'START_UPTIME=%s\n' "$start_uptime" >> "$GHFAST_METRICS_FILE"
+  printf 'START_UPTIME=%s\n' "$start_uptime" >> "$OVERCLOCK_METRICS_FILE"
 
   local cpu_stat=""
   if [[ -r /proc/stat ]]; then
@@ -239,10 +239,10 @@ mode_setup() {
       fi
     done < /proc/stat
   fi
-  printf 'CPU_STAT=%s\n' "$cpu_stat" >> "$GHFAST_METRICS_FILE"
+  printf 'CPU_STAT=%s\n' "$cpu_stat" >> "$OVERCLOCK_METRICS_FILE"
 
   if [[ -r /proc/vmstat ]]; then
-    awk '$1 ~ /^(pgpgin|pgpgout|pswpin|pswpout|nr_dirtied|nr_written|pgmajfault|oom_kill)$/ { print "VMSTAT_" $1 "=" $2 }' /proc/vmstat >> "$GHFAST_METRICS_FILE" || true
+    awk '$1 ~ /^(pgpgin|pgpgout|pswpin|pswpout|nr_dirtied|nr_written|pgmajfault|oom_kill)$/ { print "VMSTAT_" $1 "=" $2 }' /proc/vmstat >> "$OVERCLOCK_METRICS_FILE" || true
   fi
 
   local devs=()
@@ -263,7 +263,7 @@ mode_setup() {
   if [[ ${#devs[@]} -gt 0 ]]; then
     disk_devs=$(IFS=,; echo "${devs[*]}")
   fi
-  printf 'DISK_DEVICES=%s\n' "$disk_devs" >> "$GHFAST_METRICS_FILE"
+  printf 'DISK_DEVICES=%s\n' "$disk_devs" >> "$OVERCLOCK_METRICS_FILE"
 
   if [[ -n "$disk_devs" && -r /proc/diskstats ]]; then
     awk -v devs="$disk_devs" '
@@ -285,9 +285,9 @@ mode_setup() {
       print "DISK_WRITE_IOS=" w_ios;
       print "DISK_WRITE_SECTORS=" w_sec;
       print "DISK_IO_TICKS_MS=" ticks;
-    }' /proc/diskstats >> "$GHFAST_METRICS_FILE" || true
+    }' /proc/diskstats >> "$OVERCLOCK_METRICS_FILE" || true
   else
-    printf 'DISK_READ_IOS=0\nDISK_READ_SECTORS=0\nDISK_WRITE_IOS=0\nDISK_WRITE_SECTORS=0\nDISK_IO_TICKS_MS=0\n' >> "$GHFAST_METRICS_FILE"
+    printf 'DISK_READ_IOS=0\nDISK_READ_SECTORS=0\nDISK_WRITE_IOS=0\nDISK_WRITE_SECTORS=0\nDISK_IO_TICKS_MS=0\n' >> "$OVERCLOCK_METRICS_FILE"
   fi
 
   # 2. Background libnosync build
@@ -295,11 +295,11 @@ mode_setup() {
   local build_tmp=""
   local compile_result=""
 
-  if [[ "$GHFAST_FSYNC_BYPASS" == "true" ]]; then
-    build_tmp="$(mktemp -d /tmp/gh-fast-build.XXXXXX 2>/dev/null || true)"
+  if [[ "$OVERCLOCK_FSYNC_BYPASS" == "true" ]]; then
+    build_tmp="$(mktemp -d /tmp/overclock-build.XXXXXX 2>/dev/null || true)"
     if [[ -n "$build_tmp" && -d "$build_tmp" ]]; then
       compile_result="$build_tmp/result.env"
-      local nosync_src="$GHFAST_ACTION_PATH/src/nosync.c"
+      local nosync_src="$OVERCLOCK_ACTION_PATH/src/nosync.c"
       if [[ -r "$nosync_src" ]]; then
         cp "$nosync_src" "$build_tmp/nosync.c" 2>/dev/null || true
       fi
@@ -374,8 +374,8 @@ LD_PRELOAD_VALUE=libnosync.so
 COMPILE_MS=$(( t_cend - t_cstart ))
 EOF
         else
-          mkdir -p "$GHFAST_LIB_FALLBACK_DIR" 2>/dev/null || true
-          if ! install -m 0755 "$tmp_so" "$GHFAST_LIB_FALLBACK_DIR/libnosync.so" 2>/dev/null; then
+          mkdir -p "$OVERCLOCK_LIB_FALLBACK_DIR" 2>/dev/null || true
+          if ! install -m 0755 "$tmp_so" "$OVERCLOCK_LIB_FALLBACK_DIR/libnosync.so" 2>/dev/null; then
             local t_cend
             t_cend="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
             cat <<EOF > "$compile_result"
@@ -390,8 +390,8 @@ EOF
           t_cend="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
           cat <<EOF > "$compile_result"
 STATUS=active
-LIB_PATH=$GHFAST_LIB_FALLBACK_DIR/libnosync.so
-LD_PRELOAD_VALUE=$GHFAST_LIB_FALLBACK_DIR/libnosync.so
+LIB_PATH=$OVERCLOCK_LIB_FALLBACK_DIR/libnosync.so
+LD_PRELOAD_VALUE=$OVERCLOCK_LIB_FALLBACK_DIR/libnosync.so
 COMPILE_MS=$(( t_cend - t_cstart ))
 EOF
         fi
@@ -422,7 +422,7 @@ EOF
   done
 
   # 4. Page cache and sysctl tuning
-  if [[ "$GHFAST_PAGE_CACHE" != "true" ]]; then
+  if [[ "$OVERCLOCK_PAGE_CACHE" != "true" ]]; then
     state PAGE_CACHE "disabled"
   elif [[ "$IS_ROOT" != "true" ]]; then
     state PAGE_CACHE "skipped"
@@ -526,7 +526,7 @@ EOF
   fi
 
   # 5. Remount
-  if [[ "$GHFAST_REMOUNT" != "true" ]]; then
+  if [[ "$OVERCLOCK_REMOUNT" != "true" ]]; then
     state REMOUNT "disabled"
   elif [[ "$IS_ROOT" != "true" ]]; then
     state REMOUNT "skipped"
@@ -582,7 +582,7 @@ EOF
   local ws_had_files=0
   local ws_had_git=0
 
-  if [[ "$GHFAST_ZRAM" != "true" ]]; then
+  if [[ "$OVERCLOCK_ZRAM" != "true" ]]; then
     state ZRAM "disabled"
     state ZRAM_DEV ""
     state ZRAM_SIZE ""
@@ -597,7 +597,7 @@ EOF
     state ZRAM_DETAIL "requires root"
   else
     local existing_src
-    existing_src="$(findmnt -rn -o SOURCE --mountpoint "$GHFAST_WORKSPACE" 2>/dev/null || true)"
+    existing_src="$(findmnt -rn -o SOURCE --mountpoint "$OVERCLOCK_WORKSPACE" 2>/dev/null || true)"
     if [[ "$existing_src" =~ ^/dev/zram ]]; then
       state ZRAM "active"
       state ZRAM_DEV "$existing_src"
@@ -619,7 +619,7 @@ EOF
 
       if [[ "$mem_total_kb" -gt 0 ]]; then
         local zram_bytes
-        zram_bytes="$(awk -v s="$GHFAST_ZRAM_SIZE" 'BEGIN {
+        zram_bytes="$(awk -v s="$OVERCLOCK_ZRAM_SIZE" 'BEGIN {
           u = toupper(substr(s, length(s)));
           n = s;
           mult = 1;
@@ -631,7 +631,7 @@ EOF
         }')"
         local mem_limit_bytes=$(( mem_total_kb * 1024 * 2 ))
         if [[ "$zram_bytes" -gt "$mem_limit_bytes" ]]; then
-          warn "zram size ($GHFAST_ZRAM_SIZE) exceeds 2x physical RAM"
+          warn "zram size ($OVERCLOCK_ZRAM_SIZE) exceeds 2x physical RAM"
         fi
       fi
 
@@ -648,13 +648,13 @@ EOF
         local zram_algo=""
         for algo in lz4 lzo-rle ""; do
           if [[ -n "$algo" ]]; then
-            zram_dev="$(zramctl --find --size "$GHFAST_ZRAM_SIZE" --algorithm "$algo" 2>/dev/null || true)"
+            zram_dev="$(zramctl --find --size "$OVERCLOCK_ZRAM_SIZE" --algorithm "$algo" 2>/dev/null || true)"
             if [[ -n "$zram_dev" ]]; then
               zram_algo="$algo"
               break
             fi
           else
-            zram_dev="$(zramctl --find --size "$GHFAST_ZRAM_SIZE" 2>/dev/null || true)"
+            zram_dev="$(zramctl --find --size "$OVERCLOCK_ZRAM_SIZE" 2>/dev/null || true)"
             if [[ -n "$zram_dev" ]]; then
               zram_algo="default"
               break
@@ -680,27 +680,27 @@ EOF
             state ZRAM_DETAIL "mkfs.ext4 failed"
           else
             local preserve_dir=""
-            if [[ -d "$GHFAST_WORKSPACE" ]]; then
-              if [[ -e "$GHFAST_WORKSPACE/.git" ]]; then
+            if [[ -d "$OVERCLOCK_WORKSPACE" ]]; then
+              if [[ -e "$OVERCLOCK_WORKSPACE/.git" ]]; then
                 ws_had_git=1
               fi
               local ws_items=()
               shopt -s nullglob dotglob
-              ws_items=("$GHFAST_WORKSPACE"/*)
+              ws_items=("$OVERCLOCK_WORKSPACE"/*)
               shopt -u nullglob dotglob
               if [[ ${#ws_items[@]} -gt 0 ]]; then
                 ws_had_files=1
-                preserve_dir="$(dirname "$GHFAST_WORKSPACE")/.gh-fast-preserve.$$"
+                preserve_dir="$(dirname "$OVERCLOCK_WORKSPACE")/.overclock-preserve.$$"
                 mkdir -p "$preserve_dir" 2>/dev/null || true
-                find "$GHFAST_WORKSPACE" -mindepth 1 -maxdepth 1 -exec mv -t "$preserve_dir" -- {} + 2>/dev/null || true
+                find "$OVERCLOCK_WORKSPACE" -mindepth 1 -maxdepth 1 -exec mv -t "$preserve_dir" -- {} + 2>/dev/null || true
               fi
             fi
 
-            mkdir -p "$GHFAST_WORKSPACE" 2>/dev/null || true
-            if ! mount -o noatime,barrier=0,discard "$zram_dev" "$GHFAST_WORKSPACE" 2>/dev/null; then
-              warn "mount of $zram_dev on $GHFAST_WORKSPACE failed"
+            mkdir -p "$OVERCLOCK_WORKSPACE" 2>/dev/null || true
+            if ! mount -o noatime,barrier=0,discard "$zram_dev" "$OVERCLOCK_WORKSPACE" 2>/dev/null; then
+              warn "mount of $zram_dev on $OVERCLOCK_WORKSPACE failed"
               if [[ "$ws_had_files" -eq 1 && -n "$preserve_dir" && -d "$preserve_dir" ]]; then
-                cp -a "$preserve_dir/." "$GHFAST_WORKSPACE/" 2>/dev/null || true
+                cp -a "$preserve_dir/." "$OVERCLOCK_WORKSPACE/" 2>/dev/null || true
                 rm -rf "$preserve_dir" 2>/dev/null || true
               fi
               zramctl --reset "$zram_dev" 2>/dev/null || true
@@ -710,18 +710,18 @@ EOF
               state ZRAM_ALGO ""
               state ZRAM_DETAIL "mount failed"
             else
-              rmdir "$GHFAST_WORKSPACE/lost+found" 2>/dev/null || true
+              rmdir "$OVERCLOCK_WORKSPACE/lost+found" 2>/dev/null || true
               if [[ "$ws_had_files" -eq 1 && -n "$preserve_dir" && -d "$preserve_dir" ]]; then
-                cp -a "$preserve_dir/." "$GHFAST_WORKSPACE/" 2>/dev/null || true
+                cp -a "$preserve_dir/." "$OVERCLOCK_WORKSPACE/" 2>/dev/null || true
                 rm -rf "$preserve_dir" 2>/dev/null || true
-                chown -R "$GHFAST_UID:$GHFAST_GID" "$GHFAST_WORKSPACE" 2>/dev/null || true
+                chown -R "$OVERCLOCK_UID:$OVERCLOCK_GID" "$OVERCLOCK_WORKSPACE" 2>/dev/null || true
               else
-                chown "$GHFAST_UID:$GHFAST_GID" "$GHFAST_WORKSPACE" 2>/dev/null || true
+                chown "$OVERCLOCK_UID:$OVERCLOCK_GID" "$OVERCLOCK_WORKSPACE" 2>/dev/null || true
               fi
 
               state ZRAM "active"
               state ZRAM_DEV "$zram_dev"
-              state ZRAM_SIZE "$GHFAST_ZRAM_SIZE"
+              state ZRAM_SIZE "$OVERCLOCK_ZRAM_SIZE"
               state ZRAM_ALGO "$zram_algo"
               state ZRAM_DETAIL "mounted"
               zram_active=1
@@ -742,19 +742,19 @@ EOF
   fi
 
   # 7. Spill dirs
-  if [[ "$zram_active" -eq 1 && -n "$GHFAST_SPILL_DIRS" ]]; then
+  if [[ "$zram_active" -eq 1 && -n "$OVERCLOCK_SPILL_DIRS" ]]; then
     local spill_array=()
-    IFS=',' read -r -a spill_array <<< "$GHFAST_SPILL_DIRS"
+    IFS=',' read -r -a spill_array <<< "$OVERCLOCK_SPILL_DIRS"
     for dir in "${spill_array[@]}"; do
       [[ -n "$dir" ]] || continue
-      mkdir -p "/mnt/gh-fast-spill/$dir" 2>/dev/null || true
-      chown -R "$GHFAST_UID:$GHFAST_GID" "/mnt/gh-fast-spill/$dir" 2>/dev/null || true
+      mkdir -p "/mnt/overclock-spill/$dir" 2>/dev/null || true
+      chown -R "$OVERCLOCK_UID:$OVERCLOCK_GID" "/mnt/overclock-spill/$dir" 2>/dev/null || true
     done
-    chown "$GHFAST_UID:$GHFAST_GID" /mnt/gh-fast-spill 2>/dev/null || true
+    chown "$OVERCLOCK_UID:$OVERCLOCK_GID" /mnt/overclock-spill 2>/dev/null || true
 
     if [[ "$arm_mode" == "immediate" ]]; then
       warn "workspace is non-empty with existing .git; binding spill dirs immediately (actions/checkout with clean: true may conflict)"
-      state SPILL_DIRS "$GHFAST_SPILL_DIRS"
+      state SPILL_DIRS "$OVERCLOCK_SPILL_DIRS"
       state SPILL_MODE "immediate"
       state SPILL_HELPER_PID ""
       for dir in "${spill_array[@]}"; do
@@ -762,22 +762,22 @@ EOF
         bind_spill_dir "$dir"
       done
     else
-      state SPILL_DIRS "$GHFAST_SPILL_DIRS"
+      state SPILL_DIRS "$OVERCLOCK_SPILL_DIRS"
       state SPILL_MODE "deferred"
-      export GHFAST_WORKSPACE GHFAST_SPILL_DIRS GHFAST_STATE_FILE GHFAST_UID GHFAST_GID GHFAST_ARM_MODE="$arm_mode"
-      setsid "$0" spill-helper </dev/null >>/tmp/gh-fast-spill-helper.log 2>&1 &
+      export OVERCLOCK_WORKSPACE OVERCLOCK_SPILL_DIRS OVERCLOCK_STATE_FILE OVERCLOCK_UID OVERCLOCK_GID OVERCLOCK_ARM_MODE="$arm_mode"
+      setsid "$0" spill-helper </dev/null >>/tmp/overclock-spill-helper.log 2>&1 &
       local helper_pid=$!
-      echo "$helper_pid" > /tmp/gh-fast-spill-helper.pid 2>/dev/null || true
+      echo "$helper_pid" > /tmp/overclock-spill-helper.pid 2>/dev/null || true
       state SPILL_HELPER_PID "$helper_pid"
     fi
   else
-    state SPILL_DIRS "$GHFAST_SPILL_DIRS"
+    state SPILL_DIRS "$OVERCLOCK_SPILL_DIRS"
     state SPILL_MODE "none"
     state SPILL_HELPER_PID ""
   fi
 
   # 8. Git tuning
-  if [[ "$GHFAST_GIT_TUNING" != "true" ]]; then
+  if [[ "$OVERCLOCK_GIT_TUNING" != "true" ]]; then
     state GIT_TUNING "disabled"
   elif ! command -v git >/dev/null 2>&1; then
     state GIT_TUNING "failed"
@@ -825,7 +825,7 @@ EOF
     wait "$compile_pid" 2>/dev/null || true
   fi
 
-  if [[ "$GHFAST_FSYNC_BYPASS" == "true" ]]; then
+  if [[ "$OVERCLOCK_FSYNC_BYPASS" == "true" ]]; then
     if [[ -n "$compile_result" && -f "$compile_result" ]]; then
       local status=""
       local err=""

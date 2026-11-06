@@ -75,7 +75,7 @@ jobs:
           if [[ "$root_opts" == *"nobarrier"* ]] || [[ "$root_opts" == *"barrier=0"* ]]; then
             echo "Verified: root mount has nobarrier or barrier=0"
           else
-            echo "::warning title=make-github-action-fast::Root mount does not show nobarrier or barrier=0 (options: $root_opts)"
+            echo "::warning title=overclock::Root mount does not show nobarrier or barrier=0 (options: $root_opts)"
           fi
 
           # Check git config --system feature.manyFiles == true
@@ -439,7 +439,7 @@ jobs:
 
       - name: (2) Relocate action to RUNNER_TEMP and clean workspace
         run: |
-          cp -a "$GITHUB_WORKSPACE/_src" "$RUNNER_TEMP/gh-fast"
+          cp -a "$GITHUB_WORKSPACE/_src" "$RUNNER_TEMP/overclock"
           rm -rf "$GITHUB_WORKSPACE/_src"
           remaining=$(ls -A "$GITHUB_WORKSPACE")
           if [ -n "$remaining" ]; then
@@ -450,7 +450,7 @@ jobs:
 
       - name: (3) Run action main.js directly before checkout
         run: |
-          env 'INPUT_ZRAM-WORKSPACE=true' 'INPUT_ZRAM-SIZE=4G' 'INPUT_SPILL-DIRS=node_modules,target' node "$RUNNER_TEMP/gh-fast/src/main.js"
+          env 'INPUT_ZRAM-WORKSPACE=true' 'INPUT_ZRAM-SIZE=4G' 'INPUT_SPILL-DIRS=node_modules,target' node "$RUNNER_TEMP/overclock/src/main.js"
 
       - name: (4) Checkout repository into zram workspace
         uses: actions/checkout@v4
@@ -515,10 +515,10 @@ jobs:
       - name: (7) Teardown and dump helper log
         if: always()
         run: |
-          node "$RUNNER_TEMP/gh-fast/src/post.js" || true
-          if [ -f /tmp/gh-fast-spill-helper.log ]; then
-            echo "=== /tmp/gh-fast-spill-helper.log ==="
-            cat /tmp/gh-fast-spill-helper.log
+          node "$RUNNER_TEMP/overclock/src/post.js" || true
+          if [ -f /tmp/overclock-spill-helper.log ]; then
+            echo "=== /tmp/overclock-spill-helper.log ==="
+            cat /tmp/overclock-spill-helper.log
           fi
 
   cross-platform:

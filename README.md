@@ -1,14 +1,14 @@
-# make-github-action-fast
+# overclock
 
 A lightweight, zero-dependency GitHub Action that accelerates Linux CI workflows by eliminating disk I/O bottlenecks, bypassing redundant fsync operations, tuning Linux kernel page-cache writeback, optimizing Git operations, and optionally hosting the workspace in an in-memory compressed zram disk with deferred SSD spillover.
 
-Ephemeral CI runners in GitHub Actions are frequently bottlenecked by virtualized disk I/O: builds and package managers issue thousands of redundant `fsync` calls, the Linux kernel aggressively flushes dirty pages to virtual disks, and filesystem metadata updates create high I/O latency. Because CI runners are destroyed immediately after job completion, disk durability guarantees (`fsync`, write barriers, access-time updates) offer no benefit and significantly prolong build times. `make-github-action-fast` removes these bottlenecks with a setup step that targets < 300 ms. It has zero npm dependencies, requires zero configuration for common workflows, and adheres strictly to a golden safety rule: **it never fails your CI job**—if any privileged operation is restricted (such as in unprivileged container jobs), it logs a warning and degrades gracefully.
+Ephemeral CI runners in GitHub Actions are frequently bottlenecked by virtualized disk I/O: builds and package managers issue thousands of redundant `fsync` calls, the Linux kernel aggressively flushes dirty pages to virtual disks, and filesystem metadata updates create high I/O latency. Because CI runners are destroyed immediately after job completion, disk durability guarantees (`fsync`, write barriers, access-time updates) offer no benefit and significantly prolong build times. `overclock` removes these bottlenecks with a setup step that targets < 300 ms. It has zero npm dependencies, requires zero configuration for common workflows, and adheres strictly to a golden safety rule: **it never fails your CI job**—if any privileged operation is restricted (such as in unprivileged container jobs), it logs a warning and degrades gracefully.
 
 ---
 
 ## Quick Start
 
-Place `make-github-action-fast` as the first step in your job, before `actions/checkout@v4`. This ensures filesystem remounts, page-cache sysctl tuning, Git configurations, and `LD_PRELOAD` environment variables are active before repository extraction and dependency installation:
+Place `overclock` as the first step in your job, before `actions/checkout@v4`. This ensures filesystem remounts, page-cache sysctl tuning, Git configurations, and `LD_PRELOAD` environment variables are active before repository extraction and dependency installation:
 
 ```yaml
 jobs:
@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Speed up runner
-        uses: boazberman/make-github-action-fast@v1
+        uses: boazberman/overclock@v1
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Speed up runner (zram workspace)
-        uses: boazberman/make-github-action-fast@v1
+        uses: boazberman/overclock@v1
         with:
           zram-workspace: 'true'
           zram-size: '8G'
@@ -68,7 +68,7 @@ jobs:
 | `git-tuning` | Apply high-performance Git configuration (`feature.manyFiles`, multithreading, caches, disable auto-gc). | `'true'` |
 | `zram-workspace` | Mount an in-memory compressed ext4 zram disk over `$GITHUB_WORKSPACE`. | `'false'` |
 | `zram-size` | Size of the zram disk device (e.g., `4G`, `6G`, `8G`). | `'6G'` |
-| `spill-dirs` | Comma-separated directory names to bind-mount to `/mnt/gh-fast-spill` on SSD when zram is active. | `'node_modules,.cargo,.gradle,.venv,target'` |
+| `spill-dirs` | Comma-separated directory names to bind-mount to `/mnt/overclock-spill` on SSD when zram is active. | `'node_modules,.cargo,.gradle,.venv,target'` |
 | `summary` | Emit an optimization breakdown and detailed I/O telemetry table to `$GITHUB_STEP_SUMMARY`. | `'true'` |
 
 ### Outputs
@@ -86,7 +86,7 @@ jobs:
 ### 1. Fsync Interceptor via LD_PRELOAD (`libnosync.so`)
 Package managers (npm, pip, cargo), databases (SQLite, embedded test DBs), and compilers frequently issue `fsync()`, `fdatasync()`, `msync()`, or open files with `O_SYNC` to guarantee durability on persistent storage. In ephemeral CI runners, flushing writes to disk is unnecessary overhead.
 
-- **Fast on-the-fly compilation**: Rather than running `apt-get install eatmydata` (which takes ~6 seconds to update apt indexes and download packages), `make-github-action-fast` compiles `src/nosync.c` using the runner's preinstalled `gcc` in **~100 ms**.
+- **Fast on-the-fly compilation**: Rather than running `apt-get install eatmydata` (which takes ~6 seconds to update apt indexes and download packages), `overclock` compiles `src/nosync.c` using the runner's preinstalled `gcc` in **~100 ms**.
 - **Complete syscall coverage**: It no-ops `fsync`, `fdatasync`, `sync`, `syncfs`, `msync`, and `sync_file_range`. It also wraps `open`, `open64`, `openat`, `openat64`, and glibc fortified variants (`__open_2`, `__openat_2`), stripping `O_SYNC` and `O_DSYNC` flags.
 - **Setuid / sudo safety**: On Linux, setuid binaries (like `sudo`) refuse to load arbitrary paths from `LD_PRELOAD` under `AT_SECURE`, emitting noisy warnings (`ERROR: ld.so: object ... cannot be preloaded`). To prevent this:
   1. The library is installed to `/usr/local/lib/libnosync.so` and registered in `/etc/ld.so.conf.d/nosync.conf` with a detached `ldconfig`.
@@ -116,7 +116,7 @@ mount -o remount,noatime,nodiratime,barrier=0,commit=600 "$mp"
 - **`noatime,nodiratime`**: Eliminates metadata write operations on every file and directory read.
 - **`barrier=0` (`nobarrier`)**: Disables ext4 write barriers on disk cache flushes. Since power loss does not occur during successful CI runs, barrier flushing imposes substantial latency on write-heavy tasks.
 - **`commit=600`**: Increases the ext4 journaling commit interval from 5 seconds to 600 seconds (10 minutes).
-- **Why `data=writeback` is not used**: The ext4 kernel filesystem driver strictly prohibits changing the data journaling mode (e.g. from `data=ordered` to `data=writeback`) during a remount. Attempting to remount with `data=writeback` returns `EINVAL` and fails. `make-github-action-fast` intentionally omits this flag to ensure clean, reliable remounting.
+- **Why `data=writeback` is not used**: The ext4 kernel filesystem driver strictly prohibits changing the data journaling mode (e.g. from `data=ordered` to `data=writeback`) during a remount. Attempting to remount with `data=writeback` returns `EINVAL` and fails. `overclock` intentionally omits this flag to ensure clean, reliable remounting.
 
 ### 4. Git Tuning
 GitHub runners spend noticeable time reading index caches, computing status trees, and checking out refs. The action applies system-wide optimizations:
@@ -141,9 +141,9 @@ When `zram-workspace: true` is configured:
 ### 6. Spill Dirs & Deferred Bind Helper
 In-memory disks offer microsecond latency, but memory is finite. Large dependency directories (e.g., `node_modules`, `target`, `.cargo`, `.gradle`, `.venv`) can easily exceed available RAM.
 
-- **Spill redirection**: Configured spill directories are bound to the runner's physical SSD at `/mnt/gh-fast-spill/<dir>`.
+- **Spill redirection**: Configured spill directories are bound to the runner's physical SSD at `/mnt/overclock-spill/<dir>`.
 - **The actions/checkout conflict**: `actions/checkout@v4` cleans an existing workspace using `io.rmRF()` before fetching code. Attempting to `rmdir` an active mountpoint returns `EBUSY`, which causes `actions/checkout` to fail!
-- **The deferred bind helper**: If `make-github-action-fast` runs before checkout on an empty workspace, it spawns a detached background helper (`setsid ... spill-helper`). The helper polls the workspace and waits for the first entry to appear — with `actions/checkout` that is `.git`, created by `git init` *after* checkout's cleanup phase. It then creates the spill directories and bind-mounts them to `/mnt/gh-fast-spill/*` long before any dependency install step runs. A directory that already exists with content is never hidden by a mount (it is reported as skipped). If the action runs after checkout on an existing repo, bindings occur immediately (in that case avoid a second `actions/checkout` with `clean: true` in the same job).
+- **The deferred bind helper**: If `overclock` runs before checkout on an empty workspace, it spawns a detached background helper (`setsid ... spill-helper`). The helper polls the workspace and waits for the first entry to appear — with `actions/checkout` that is `.git`, created by `git init` *after* checkout's cleanup phase. It then creates the spill directories and bind-mounts them to `/mnt/overclock-spill/*` long before any dependency install step runs. A directory that already exists with content is never hidden by a mount (it is reported as skipped). If the action runs after checkout on an existing repo, bindings occur immediately (in that case avoid a second `actions/checkout` with `clean: true` in the same job).
 
 ---
 
@@ -156,7 +156,7 @@ flowchart TD
     PlatCheck -- Yes --> Priv{"root or sudo -n?"}
     Priv -- Yes --> Script["sudo setup-linux.sh"]
     Priv -- No --> Degraded["setup-linux.sh unprivileged (degraded)"]
-    Script --> Baseline["Baseline telemetry to /tmp/gh-fast-metrics-start.env"]
+    Script --> Baseline["Baseline telemetry to /tmp/overclock-metrics-start.env"]
     Degraded --> Baseline
     Baseline --> Bld["Background: gcc libnosync.so"]
     Baseline --> Sysctl["Page cache sysctls"]
@@ -176,7 +176,7 @@ flowchart TD
 
 ## Safety & OOM Management
 
-A core design tenet of `make-github-action-fast` is that **it must never break or crash a user's workflow**:
+A core design tenet of `overclock` is that **it must never break or crash a user's workflow**:
 - **Reclaimable page cache**: Raising the dirty ratios lets RAM absorb bursts of writes, but dirty pages are still page cache, not anonymous memory: the flusher threads write them back under pressure and writers are throttled once `dirty_ratio` is reached, so the kernel stalls writers rather than OOM-killing processes. Swap is de-prioritised (`swappiness=10`), not disabled.
 - **zram logical limit**: The zram block device has a strict size ceiling (default 6G), compressed with `lz4` (yielding ~2x–3x effective data storage).
 - **Physical disk spillover**: By routing high-volume directories like `node_modules` and `target` to `/mnt` SSD, the workspace memory footprint remains bounded.
@@ -231,8 +231,8 @@ When zram is active, a third table reports the device, algorithm, original vs. c
 
 The repository includes an automated matrix benchmark workflow in `.github/workflows/benchmark.yml` evaluating three modes across `ubuntu-22.04`, `ubuntu-24.04`, and `ubuntu-24.04-arm`:
 1. **Baseline**: Default GitHub Actions runner configuration.
-2. **Accelerated**: `make-github-action-fast` standard mode (fsync bypass, page cache, remount, git).
-3. **Accelerated (zram)**: `make-github-action-fast` with `zram-workspace: true` and SSD spill dirs.
+2. **Accelerated**: `overclock` standard mode (fsync bypass, page cache, remount, git).
+3. **Accelerated (zram)**: `overclock` with `zram-workspace: true` and SSD spill dirs.
 
 The suite runs:
 - **SQLite 5,000 fsync transactions**: Measures synchronous database commit latency with `PRAGMA synchronous=FULL`.

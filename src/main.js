@@ -98,16 +98,16 @@ function applyGitFallback() {
 function run() {
   try {
     if (process.platform !== 'linux') {
-      console.log(`::notice title=make-github-action-fast::Unsupported platform ${process.platform}; skipping (Linux runners only).`);
+      console.log(`::notice title=overclock::Unsupported platform ${process.platform}; skipping (Linux runners only).`);
       return;
     }
 
     const inputs = parseInputs(process.env);
     const actionPath = path.resolve(__dirname, '..');
     const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
-    const stateFile = '/tmp/gh-fast-state.env';
-    const metricsFile = '/tmp/gh-fast-metrics-start.env';
-    const fallbackDir = path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'gh-fast');
+    const stateFile = '/tmp/overclock-state.env';
+    const metricsFile = '/tmp/overclock-metrics-start.env';
+    const fallbackDir = path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'overclock');
 
     let uid = 1000;
     let gid = 1000;
@@ -120,32 +120,32 @@ function run() {
     }
 
     const scriptEnv = {
-      GHFAST_ACTION_PATH: actionPath,
-      GHFAST_FSYNC_BYPASS: String(inputs.fsyncBypass),
-      GHFAST_PAGE_CACHE: String(inputs.pageCache),
-      GHFAST_REMOUNT: String(inputs.remount),
-      GHFAST_GIT_TUNING: String(inputs.gitTuning),
-      GHFAST_ZRAM: String(inputs.zram),
-      GHFAST_ZRAM_SIZE: inputs.zramSize,
-      GHFAST_SPILL_DIRS: inputs.spillDirs,
-      GHFAST_WORKSPACE: workspace,
-      GHFAST_UID: String(uid),
-      GHFAST_GID: String(gid),
-      GHFAST_STATE_FILE: stateFile,
-      GHFAST_METRICS_FILE: metricsFile,
-      GHFAST_LIB_FALLBACK_DIR: fallbackDir,
-      GHFAST_START_EPOCH_MS: String(T0),
+      OVERCLOCK_ACTION_PATH: actionPath,
+      OVERCLOCK_FSYNC_BYPASS: String(inputs.fsyncBypass),
+      OVERCLOCK_PAGE_CACHE: String(inputs.pageCache),
+      OVERCLOCK_REMOUNT: String(inputs.remount),
+      OVERCLOCK_GIT_TUNING: String(inputs.gitTuning),
+      OVERCLOCK_ZRAM: String(inputs.zram),
+      OVERCLOCK_ZRAM_SIZE: inputs.zramSize,
+      OVERCLOCK_SPILL_DIRS: inputs.spillDirs,
+      OVERCLOCK_WORKSPACE: workspace,
+      OVERCLOCK_UID: String(uid),
+      OVERCLOCK_GID: String(gid),
+      OVERCLOCK_STATE_FILE: stateFile,
+      OVERCLOCK_METRICS_FILE: metricsFile,
+      OVERCLOCK_LIB_FALLBACK_DIR: fallbackDir,
+      OVERCLOCK_START_EPOCH_MS: String(T0),
     };
 
-    console.log('::group::make-github-action-fast setup');
+    console.log('::group::overclock setup');
     const setupScript = path.join(actionPath, 'src', 'setup-linux.sh');
     const scriptResult = runRootScript(setupScript, ['setup'], scriptEnv);
     console.log('::endgroup::');
 
     if (scriptResult.error) {
-      console.log(`::warning title=make-github-action-fast::setup-linux.sh execution error: ${scriptResult.error.message}`);
+      console.log(`::warning title=overclock::setup-linux.sh execution error: ${scriptResult.error.message}`);
     } else if (scriptResult.status !== 0) {
-      console.log(`::warning title=make-github-action-fast::setup-linux.sh exited with code ${scriptResult.status}`);
+      console.log(`::warning title=overclock::setup-linux.sh exited with code ${scriptResult.status}`);
     }
 
     // Read and parse state file
@@ -209,10 +209,10 @@ function run() {
       zramStr += `(${state.ZRAM_DEV})`;
     }
 
-    console.log(`⚡ make-github-action-fast: fsync-bypass=${fsyncStr} page-cache=${cacheStr} remount=${remountStr} git=${gitStr} zram=${zramStr} — setup ${setupMs} ms`);
+    console.log(`⚡ overclock: fsync-bypass=${fsyncStr} page-cache=${cacheStr} remount=${remountStr} git=${gitStr} zram=${zramStr} — setup ${setupMs} ms`);
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
-    console.log(`::warning title=make-github-action-fast::Setup encountered an error: ${msg}`);
+    console.log(`::warning title=overclock::Setup encountered an error: ${msg}`);
   }
 }
 

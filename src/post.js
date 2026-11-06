@@ -378,7 +378,7 @@ function getZramInfo(devName, state, workspace) {
 function generateMarkdown({ optimizations, telemetry, zram, footer }) {
   const lines = [];
 
-  lines.push('## ⚡ make-github-action-fast');
+  lines.push('## ⚡ overclock');
   lines.push('');
 
   // Table 1: Optimizations
@@ -441,7 +441,7 @@ function generatePlainTextSummary({ optimizations, telemetry }) {
   }
 
   return [
-    '⚡ make-github-action-fast telemetry summary:',
+    '⚡ overclock telemetry summary:',
     `  Optimizations: ${optSummary}`,
     `  I/O: writes=${metricMap['Physical disk writes'] || 'n/a'}, reads=${metricMap['Physical disk reads'] || 'n/a'}, disk-busy=${metricMap['Disk busy %'] || '0.0%'}, iowait=${metricMap['CPU iowait avg'] || '0.0%'}`,
     `  Memory: available/total=${metricMap['Memory available / total'] || 'n/a'}, dirty=${metricMap['Dirty now'] || 'n/a'}, page-cache=${metricMap['Page cache'] || 'n/a'}`,
@@ -683,8 +683,8 @@ function run() {
       return;
     }
 
-    const stateFile = process.env.STATE_state_file || '/tmp/gh-fast-state.env';
-    const metricsFile = process.env.STATE_metrics_file || '/tmp/gh-fast-metrics-start.env';
+    const stateFile = process.env.STATE_state_file || '/tmp/overclock-state.env';
+    const metricsFile = process.env.STATE_metrics_file || '/tmp/overclock-metrics-start.env';
     const rawSummary = process.env.STATE_summary !== undefined ? process.env.STATE_summary : (process.env.INPUT_SUMMARY || 'true');
     const summaryEnabled = parseBool(rawSummary, true);
     const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
@@ -725,14 +725,14 @@ function run() {
     if (process.env.RUNNER_ENVIRONMENT === 'self-hosted' && (state.ZRAM === 'active' || state.ORIG_SYSCTL)) {
       const actionPath = path.resolve(__dirname, '..');
       const teardownEnv = {
-        GHFAST_STATE_FILE: stateFile,
-        GHFAST_WORKSPACE: workspace,
+        OVERCLOCK_STATE_FILE: stateFile,
+        OVERCLOCK_WORKSPACE: workspace,
       };
       runRootScript(path.join(actionPath, 'src', 'setup-linux.sh'), ['teardown'], teardownEnv);
     }
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
-    console.log(`::warning title=make-github-action-fast::Post step encountered an error: ${msg}`);
+    console.log(`::warning title=overclock::Post step encountered an error: ${msg}`);
   }
 }
 

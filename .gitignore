@@ -13,7 +13,7 @@ libnosync.so
 # Logs and runtime artifacts
 *.log
 /tmp/
-.gh-fast*
+.overclock*
 
 # OS artifacts
 .DS_Store

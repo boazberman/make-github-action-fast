@@ -1,4 +1,4 @@
-name: 'Make GitHub Action Fast'
+name: 'Overclock'
 description: 'Accelerate GitHub Actions Linux workflows with LD_PRELOAD fsync bypass, aggressive page-cache sysctl, ext4 remount, Git optimizations, and optional zram workspace with deferred spillover.'
 author: 'boazberman'
 branding:
@@ -31,7 +31,7 @@ inputs:
     required: false
     default: '6G'
   spill-dirs:
-    description: 'Comma-separated directory names to bind-mount to /mnt/gh-fast-spill to prevent zram overflow. Only active when zram-workspace is true.'
+    description: 'Comma-separated directory names to bind-mount to /mnt/overclock-spill to prevent zram overflow. Only active when zram-workspace is true.'
     required: false
     default: 'node_modules,.cargo,.gradle,.venv,target'
   summary:

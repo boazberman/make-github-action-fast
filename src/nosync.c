@@ -1,5 +1,5 @@
 /*
- * make-github-action-fast - libnosync
+ * overclock - libnosync
  * Intercepts fsync / sync / syncfs / msync / sync_file_range and strips O_SYNC / O_DSYNC from open / openat.
  */
 
