@@ -180,7 +180,7 @@ for ((r=0; r<REPS; r++)); do
           cd "$TARGET_DIR"
           UV_CACHE="$RUNNER_TEMP/uv-cache"
           "$RUNNER_TEMP/uv-tool/bin/uv" pip install --offline --python "$RUNNER_TEMP/fastapi-bench-venv/bin/python" --cache-dir "$UV_CACHE" pytest -e ".[all]" >"$RUNNER_TEMP/rw-fastapi.log" 2>&1 || { tail -n 40 "$RUNNER_TEMP/rw-fastapi.log"; exit 1; }
-          "$RUNNER_TEMP/fastapi-bench-venv/bin/pytest" tests/test_tutorial -q >"$RUNNER_TEMP/rw-fastapi.log" 2>&1 || { tail -n 40 "$RUNNER_TEMP/rw-fastapi.log"; exit 1; }
+          "$RUNNER_TEMP/fastapi-bench-venv/bin/pytest" tests/test_tutorial -q -W ignore::DeprecationWarning >"$RUNNER_TEMP/rw-fastapi.log" 2>&1 || { tail -n 40 "$RUNNER_TEMP/rw-fastapi.log"; exit 1; }
         )
         ;;
       redis)
