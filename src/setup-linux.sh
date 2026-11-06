@@ -596,8 +596,10 @@ mode_setup() {
       [[ -n "$target" ]] || continue
       local temp_stage=""
       local has_files=0
+      local existed=0
 
       if [[ -d "$target" ]]; then
+        existed=1
         local entries=()
         shopt -s nullglob dotglob
         entries=("$target"/*)
@@ -610,7 +612,25 @@ mode_setup() {
           fi
         fi
       else
-        mkdir -p "$target" 2>>"$SETUP_LOG" || true
+        # Create missing components owned by the runner user (not root), so
+        # e.g. a new ~/.cache stays writable for later steps.
+        local missing=() p="$target"
+        while [[ -n "$p" && "$p" != "/" && ! -e "$p" ]]; do
+          missing=("$p" "${missing[@]}")
+          p="$(dirname "$p")"
+        done
+        for p in "${missing[@]}"; do
+          install -d -o "$OVERCLOCK_UID" -g "$OVERCLOCK_GID" "$p" 2>>"$SETUP_LOG" || true
+        done
+      fi
+
+      # Remember the mount root's original owner/mode. Only the root gets these;
+      # copied contents keep their own ownership via cp -a (no recursive chown).
+      local root_owner="$OVERCLOCK_UID:$OVERCLOCK_GID"
+      local root_mode="0755"
+      if [[ "$existed" -eq 1 ]]; then
+        root_owner="$(stat -c '%u:%g' "$target" 2>/dev/null || echo "$root_owner")"
+        root_mode="$(stat -c '%a' "$target" 2>/dev/null || echo "$root_mode")"
       fi
 
       if mount -t tmpfs -o "$size_opt" tmpfs "$target" 2>>"$SETUP_LOG"; then
@@ -618,7 +638,8 @@ mode_setup() {
           cp -a "$temp_stage/." "$target/" 2>>"$SETUP_LOG" || true
           rm -rf "$temp_stage" 2>>"$SETUP_LOG" || true
         fi
-        chown -R "$OVERCLOCK_UID:$OVERCLOCK_GID" "$target" 2>>"$SETUP_LOG" || true
+        chown "$root_owner" "$target" 2>>"$SETUP_LOG" || true
+        chmod "$root_mode" "$target" 2>>"$SETUP_LOG" || true
         mounted_paths+=("$target")
       else
         if [[ -n "$temp_stage" && -d "$temp_stage" ]]; then

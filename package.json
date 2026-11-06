@@ -9,7 +9,7 @@
   },
   "scripts": {
     "test": "node --test \"test/*.test.js\"",
-    "lint": "node --check src/main.js && node --check src/post.js && node --check src/common.js && node --check test/common.test.js && node --check test/main.test.js && node --check test/post.test.js && node --check test/index.js",
+    "lint": "node --check src/main.js && node --check src/post.js && node --check src/common.js && node --check test/common.test.js && node --check test/main.test.js && node --check test/post.test.js",
     "build:lib": "gcc -O2 -shared -fPIC -pthread -U_FORTIFY_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror -o libnosync.so src/nosync.c -ldl"
   },
   "repository": "boazberman/overclock",
