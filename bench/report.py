@@ -175,7 +175,7 @@ def main():
                 else:
                     if med > 0 and base_median > 0:
                         ratio = base_median / med
-                        speedup_str = f"**{ratio:.2f}x**" if ratio >= 1.05 else f"{ratio:.2f}x"
+                        speedup_str = f"{ratio:.2f}x"
                     else:
                         speedup_str = "n/a"
 
@@ -187,6 +187,9 @@ def main():
                             sig_str = "No"
                         else:
                             sig_str = "**Yes**"
+                            # Bold only statistically significant speedups
+                            if speedup_str not in ("n/a",) and ci_low > 1.0:
+                                speedup_str = f"**{speedup_str}**"
                     else:
                         ci_str = "n/a"
                         sig_str = "n/a"

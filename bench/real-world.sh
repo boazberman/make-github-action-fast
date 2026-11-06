@@ -59,12 +59,17 @@ case "$PROJECT" in
       git clone --quiet --depth 1 --branch "0.115.4" "https://github.com/fastapi/fastapi.git" "$TARGET_DIR"
     fi
     UV_CACHE="$RUNNER_TEMP/uv-cache"
-    python3 -m pip install -q uv >/dev/null 2>&1 || true
+    # PEP 668 blocks system-wide pip installs on Ubuntu 24.04: install uv into its own venv.
+    if [ ! -x "$RUNNER_TEMP/uv-tool/bin/uv" ]; then
+      python3 -m venv "$RUNNER_TEMP/uv-tool"
+      "$RUNNER_TEMP/uv-tool/bin/pip" install -q uv
+    fi
+    UV="$RUNNER_TEMP/uv-tool/bin/uv"
     rm -rf "$RUNNER_TEMP/fastapi-warmup-venv"
     python3 -m venv "$RUNNER_TEMP/fastapi-warmup-venv"
     (
       cd "$TARGET_DIR"
-      "$RUNNER_TEMP/fastapi-warmup-venv/bin/python" -m uv pip install --cache-dir "$UV_CACHE" pytest -e ".[all]" >/dev/null 2>&1 || true
+      "$UV" pip install --python "$RUNNER_TEMP/fastapi-warmup-venv/bin/python" --cache-dir "$UV_CACHE" pytest -e ".[all]"
     )
     rm -rf "$RUNNER_TEMP/fastapi-warmup-venv"
     ;;
@@ -174,8 +179,8 @@ for ((r=0; r<REPS; r++)); do
         (
           cd "$TARGET_DIR"
           UV_CACHE="$RUNNER_TEMP/uv-cache"
-          "$RUNNER_TEMP/fastapi-bench-venv/bin/python" -m uv pip install --offline --cache-dir "$UV_CACHE" -e ".[all]" >/dev/null 2>&1
-          "$RUNNER_TEMP/fastapi-bench-venv/bin/pytest" tests/test_tutorial -q >/dev/null 2>&1
+          "$RUNNER_TEMP/uv-tool/bin/uv" pip install --offline --python "$RUNNER_TEMP/fastapi-bench-venv/bin/python" --cache-dir "$UV_CACHE" pytest -e ".[all]" >"$RUNNER_TEMP/rw-fastapi.log" 2>&1 || { tail -n 40 "$RUNNER_TEMP/rw-fastapi.log"; exit 1; }
+          "$RUNNER_TEMP/fastapi-bench-venv/bin/pytest" tests/test_tutorial -q >"$RUNNER_TEMP/rw-fastapi.log" 2>&1 || { tail -n 40 "$RUNNER_TEMP/rw-fastapi.log"; exit 1; }
         )
         ;;
       redis)
